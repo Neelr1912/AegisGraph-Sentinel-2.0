@@ -418,12 +418,26 @@ app = FastAPI(
 )
 
 # CORS middleware
+#
+# CWE-942 prevention: `allow_origins=["*"]` combined with
+# `allow_credentials=True` makes Starlette reflect the request's Origin
+# header back, effectively allowing credentialed cross-origin requests
+# from any site. Read the allowed origins from AEGIS_ALLOWED_ORIGINS
+# (comma-separated) instead, defaulting to local dev URLs.
+_default_origins = "http://localhost:3000,http://localhost:8501,http://127.0.0.1:8501"
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv("AEGIS_ALLOWED_ORIGINS", _default_origins).split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
 )
 
 # Global state

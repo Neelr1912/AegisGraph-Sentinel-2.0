@@ -189,15 +189,63 @@ class TestBatchFraudCheck:
 
 
 class TestCORSandSecurity:
-    """Test CORS and security headers"""
-    
-    def test_cors_headers(self):
-        """Test CORS headers are present"""
-        response = client.get("/health", headers={"Origin": "http://localhost:3000"})
-        
-        # Should have CORS headers
+    """
+    Test CORS middleware and security headers.
+
+    The CORS tests are regression coverage for issue #34
+    (CWE-942: Permissive Cross-domain Policy with Untrusted Domains).
+    """
+
+    def test_allowed_origin_gets_acao_header(self):
+        """A request from an allowed origin should be echoed back."""
+        response = client.get(
+            "/health",
+            headers={"Origin": "http://localhost:8501"},
+        )
         assert response.status_code == 200
-    
+        assert response.headers.get("access-control-allow-origin") == "http://localhost:8501"
+
+    def test_disallowed_origin_does_not_get_acao_header(self):
+        """A request from an unlisted origin should not be granted CORS access."""
+        response = client.get(
+            "/health",
+            headers={"Origin": "https://attacker.example"},
+        )
+        assert response.status_code == 200
+        # The origin must not be reflected back, even though credentials are enabled.
+        assert response.headers.get("access-control-allow-origin") != "https://attacker.example"
+
+    def test_credentials_allowed_for_listed_origin(self):
+        """When the origin matches, credentials should be allowed."""
+        response = client.get(
+            "/health",
+            headers={"Origin": "http://localhost:8501"},
+        )
+        assert response.headers.get("access-control-allow-credentials") == "true"
+
+    def test_preflight_advertises_only_configured_methods(self):
+        """OPTIONS preflight from a listed origin should advertise the
+        narrowed method set, not '*'."""
+        response = client.options(
+            "/health",
+            headers={
+                "Origin": "http://localhost:8501",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Content-Type",
+            },
+        )
+        allow_methods = response.headers.get("access-control-allow-methods", "")
+        assert "GET" in allow_methods
+        assert "POST" in allow_methods
+        assert "*" not in allow_methods
+
+    def test_no_wildcard_origin_regression(self):
+        """Make sure we never silently regress to allow_origins=['*']."""
+        from src.api.main import ALLOWED_ORIGINS
+        assert "*" not in ALLOWED_ORIGINS, (
+            "ALLOWED_ORIGINS must be an explicit list of trusted origins"
+        )
+
     def test_rate_limiting(self):
         """Test rate limiting (if implemented)"""
         # Make multiple rapid requests
