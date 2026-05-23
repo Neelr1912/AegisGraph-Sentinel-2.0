@@ -21,7 +21,9 @@ try:
     TORCH_GEOMETRIC_AVAILABLE = True
 except ImportError:
     print("⚠️  torch_geometric not available - HTGAT will use fallback implementation")
-    MessagePassing = object  # Fallback base class
+    class MessagePassing:
+        def __init__(self, **kwargs):
+            pass
     TORCH_GEOMETRIC_AVAILABLE = False
     
     def softmax(src, index, num_nodes=None):
