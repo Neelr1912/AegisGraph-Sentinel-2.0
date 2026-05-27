@@ -1026,6 +1026,124 @@ elif page == "📊 Risk Analytics":
             # Clear after display or on next run
             st.session_state.action_taken = None
 
+    st.markdown("---")
+    
+    with st.expander("🚨 Realtime Fraud Alert Center", expanded=True):
+        st.markdown("""
+        <style>
+        .alert-card {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            animation: slideIn 0.3s ease-out forwards;
+            transition: transform 0.2s;
+        }
+        .alert-card:hover {
+            transform: translateX(5px);
+            background: rgba(30, 41, 59, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        .severity-badge {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .severity-Low { background: rgba(16, 185, 129, 0.2); color: #10b981; border: 1px solid #10b981; }
+        .severity-Medium { background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid #f59e0b; }
+        .severity-High { background: rgba(249, 115, 22, 0.2); color: #f97316; border: 1px solid #f97316; }
+        .severity-Critical { background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444; animation: pulse 2s infinite; }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        .alert-time { font-family: monospace; color: #94a3b8; font-size: 0.85rem; }
+        .alert-title { font-weight: 600; color: #f1f5f9; margin: 0 12px; flex-grow: 1; }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Initialize alerts
+        if 'realtime_alerts' not in st.session_state:
+            st.session_state.realtime_alerts = [
+                {"id": "AL-1001", "time": pd.Timestamp.now() - pd.Timedelta(seconds=45), "severity": "Critical", "title": "Mule Ring Topology Detected (Fan-out)", "category": "Graph"},
+                {"id": "AL-1002", "time": pd.Timestamp.now() - pd.Timedelta(seconds=120), "severity": "High", "title": "Velocity Spike on ACC00003254", "category": "Velocity"},
+                {"id": "AL-1003", "time": pd.Timestamp.now() - pd.Timedelta(minutes=5), "severity": "Medium", "title": "Hesitation Cadence Anomaly", "category": "Biometric"},
+                {"id": "AL-1004", "time": pd.Timestamp.now() - pd.Timedelta(minutes=15), "severity": "Low", "title": "Unusual Device Fingerprint", "category": "Device"}
+            ]
+            
+        # Simulate incoming alerts if live
+        if is_live and np.random.random() > 0.6:
+            severities = ["Low", "Medium", "High", "Critical"]
+            probs = [0.4, 0.3, 0.2, 0.1]
+            sev = np.random.choice(severities, p=probs)
+            
+            categories = {"Low": "Device", "Medium": "Biometric", "High": "Velocity", "Critical": "Graph"}
+            titles = {
+                "Low": ["New IP Address Login", "Unusual Browser User-Agent", "Minor Typo Correction Rate"],
+                "Medium": ["Hesitation Cadence Anomaly", "High Flight Time (Keyboard)", "Location Jump (100km)"],
+                "High": ["Velocity Spike on Account", "Multiple Rapid Transfers", "Known Bad Actor Interaction"],
+                "Critical": ["Mule Ring Topology Detected", "Large Value Extraction", "Account Takeover Pattern"]
+            }
+            
+            new_alert = {
+                "id": f"AL-{int(time.time())}",
+                "time": pd.Timestamp.now(),
+                "severity": sev,
+                "title": np.random.choice(titles[sev]),
+                "category": categories[sev]
+            }
+            st.session_state.realtime_alerts.insert(0, new_alert)
+            # Keep max 50
+            if len(st.session_state.realtime_alerts) > 50:
+                st.session_state.realtime_alerts.pop()
+                
+        # Filters UI
+        filter_col1, filter_col2 = st.columns([2, 1])
+        with filter_col1:
+            # Safely try to use st.pills if available in this Streamlit version, else fallback to multiselect
+            try:
+                selected_severities = st.pills("Filter by Severity", ["Critical", "High", "Medium", "Low"], default=["Critical", "High", "Medium", "Low"], selection_mode="multi")
+            except AttributeError:
+                selected_severities = st.multiselect("Filter by Severity", ["Critical", "High", "Medium", "Low"], default=["Critical", "High", "Medium", "Low"])
+        with filter_col2:
+            search_term = st.text_input("🔍 Search Alerts", placeholder="e.g. Mule, Velocity...")
+            
+        # Filter alerts
+        filtered_alerts = [
+            a for a in st.session_state.realtime_alerts 
+            if a["severity"] in (selected_severities or [])
+            and (search_term.lower() in a["title"].lower() or search_term.lower() in a["category"].lower() or search_term.lower() in a["id"].lower())
+        ]
+        
+        # Render Alerts
+        st.markdown('<div style="max-height: 400px; overflow-y: auto; padding-right: 10px; margin-top: 15px;">', unsafe_allow_html=True)
+        if not filtered_alerts:
+            st.info("No alerts match the current filters.")
+        else:
+            for alert in filtered_alerts:
+                time_str = alert["time"].strftime("%H:%M:%S")
+                html = f"""
+                <div class="alert-card">
+                    <span class="alert-time">{time_str}</span>
+                    <span class="alert-title">[{alert['category']}] {alert['title']} <span style="color:#64748b; font-size:0.75rem; margin-left:8px;">#{alert['id']}</span></span>
+                    <span class="severity-badge severity-{alert['severity']}">{alert['severity']}</span>
+                </div>
+                """
+                st.markdown(html, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
     if is_live:
         time.sleep(2)
         st.rerun()
