@@ -222,7 +222,6 @@ try:
     from ..features.honeypot_escrow import HoneypotEscrowManager
     from ..features.blockchain_evidence import BlockchainEvidenceManager
     from ..features.aegis_oracle_explainer import AegisOracleExplainer
-    from ..features.lateral_movement import LateralMovementDetector
     INNOVATIONS_AVAILABLE = True
 except (ImportError, SyntaxError) as e:
     _api_logger.warning(
@@ -230,6 +229,17 @@ except (ImportError, SyntaxError) as e:
         event_type="innovation_import_fallback",
     )
     INNOVATIONS_AVAILABLE = False
+
+LATERAL_MOVEMENT_AVAILABLE = False
+try:
+    from ..features.lateral_movement import LateralMovementDetector
+    LATERAL_MOVEMENT_AVAILABLE = True
+except (ImportError, SyntaxError) as e:
+    _api_logger.warning(
+        f"Lateral movement module unavailable ({e})",
+        event_type="innovation_import_fallback",
+    )
+    LATERAL_MOVEMENT_AVAILABLE = False
        
     # Demo mode functions
     def compute_risk_score(transaction: dict, biometrics: dict = None, **kwargs) -> dict:
@@ -782,11 +792,18 @@ def _initialize_innovation_runtime(startup_logger):
                 f"Aegis-Oracle initialization failed: {e}",
                 event_type="innovation_init_failed",
             )
-        
+
+    if LATERAL_MOVEMENT_AVAILABLE:
         try:
             state.lateral_movement_detector = LateralMovementDetector()
+            state.services.register_service(
+                "lateral_movement_detector",
+                state.lateral_movement_detector,
+                replace=True,
+            )
             startup_logger.info("Lateral Movement Detector initialized", event_type="innovation_ready")
         except Exception as e:
+            state.lateral_movement_detector = None
             startup_logger.warning(
                 f"Lateral movement initialization failed: {e}",
                 event_type="innovation_init_failed",
@@ -847,7 +864,7 @@ def _run_scoring_pipeline(
         biometrics=biometrics,
     )
 
-    if innovations_available and lateral_detector is not None:
+    if lateral_detector is not None:
         try:
             lateral_detector.update_graph(source_account, target_account)
             lm_risk_added, is_pivoting = lateral_detector.analyze_account(source_account)
@@ -1163,7 +1180,7 @@ async def check_transaction(request: TransactionCheckRequest):
                 biometrics,
                 request.source_account,
                 request.target_account,
-                state.lateral_movement_detector if INNOVATIONS_AVAILABLE else None,
+                state.lateral_movement_detector,
                 INNOVATIONS_AVAILABLE,
             ),
         )
