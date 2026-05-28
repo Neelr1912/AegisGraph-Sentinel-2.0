@@ -11,7 +11,9 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.api import main as api_main
 from src.api.main import app, state
+from src.api.schemas import RiskBreakdown, TransactionCheckResponse
 
 
 client = TestClient(app)
@@ -135,15 +137,15 @@ class TestFraudCheckEndpoint:
         assert "factors" in data
         assert "behavioral" in data["factors"]
 
-    def test_internal_approve_maps_to_allow_in_api_response(self, monkeypatch):
-        """Internal APPROVE decision must map back to ALLOW for API stability"""
+    def test_internal_allow_maps_to_approve_in_api_response(self, monkeypatch):
+        """Internal ALLOW decision must map to approve for API stability"""
         original_decisions = dict(state.decisions)
         state.decisions = {"ALLOW": 0, "REVIEW": 0, "BLOCK": 0}
 
         def fake_compute_risk_score(transaction: dict, biometrics: dict = None, **kwargs):
             return {
                 'risk_score': 0.20,
-                'decision': 'APPROVE',
+                'decision': 'ALLOW',
                 'confidence': 0.85,
                 'breakdown': {'graph': 0.0, 'velocity': 0.0, 'behavior': 0.0, 'entropy': 0.0},
             }
@@ -151,11 +153,11 @@ class TestFraudCheckEndpoint:
         monkeypatch.setattr('src.api.main.compute_risk_score', fake_compute_risk_score)
 
         transaction = {
-            "transaction_id": "test_approve_001",
+            "transaction_id": "test_allow_001",
             "amount": 100.0,
             "timestamp": 1234567890.0,
-            "from_account": "user_approve",
-            "to_account": "merchant_approve",
+            "from_account": "user_allow",
+            "to_account": "merchant_allow",
             "transaction_type": "payment"
         }
 
@@ -183,6 +185,67 @@ class TestFraudCheckEndpoint:
 
 class TestBatchFraudCheck:
     """Test batch fraud check endpoint"""
+
+    def test_batch_aggregates_canonical_decisions(self, monkeypatch):
+        """Batch totals should count API decision values correctly."""
+
+        async def fake_check_transaction(txn_request):
+            decision_by_transaction = {
+                "batch_allow": "approve",
+                "batch_review": "review",
+                "batch_block": "block",
+            }
+            decision = decision_by_transaction[txn_request.transaction_id]
+            return TransactionCheckResponse(
+                transaction_id=txn_request.transaction_id,
+                risk_score=0.25,
+                decision=decision,
+                factors={"graph": 0.0, "velocity": 0.0, "behavior": 0.0, "entropy": 0.0},
+                confidence=0.9,
+                breakdown=RiskBreakdown(graph=0.0, velocity=0.0, behavior=0.0, entropy=0.0),
+                explanation="ok",
+                recommended_action=decision,
+                processing_time_ms=1.0,
+                timestamp="2026-01-01T00:00:00Z",
+            )
+
+        monkeypatch.setattr('src.api.main.check_transaction', fake_check_transaction)
+
+        transactions = [
+            {
+                "transaction_id": "batch_allow",
+                "amount": 50.0,
+                "timestamp": 1234567890.0,
+                "from_account": "user_allow",
+                "to_account": "merchant_allow",
+                "transaction_type": "payment",
+            },
+            {
+                "transaction_id": "batch_review",
+                "amount": 75.0,
+                "timestamp": 1234567950.0,
+                "from_account": "user_review",
+                "to_account": "merchant_review",
+                "transaction_type": "payment",
+            },
+            {
+                "transaction_id": "batch_block",
+                "amount": 100.0,
+                "timestamp": 1234568010.0,
+                "from_account": "user_block",
+                "to_account": "merchant_block",
+                "transaction_type": "payment",
+            },
+        ]
+
+        response = client.post("/api/v1/fraud/batch", json={"transactions": transactions})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_allowed"] == 1
+        assert data["total_review"] == 1
+        assert data["total_blocked"] == 1
+        assert data["total_processed"] == 3
     
     def test_batch_check(self):
         """Test batch processing of transactions"""
@@ -219,6 +282,51 @@ class TestBatchFraudCheck:
         assert response.status_code == 200
         data = response.json()
         assert len(data["results"]) == 0
+
+    def test_batch_processing_is_chunked(self, monkeypatch):
+        """Batch processing should fan out in bounded chunks."""
+        call_sizes = []
+
+        async def fake_check_transaction(txn_request):
+            return TransactionCheckResponse(
+                transaction_id=txn_request.transaction_id,
+                risk_score=0.25,
+                decision="approve",
+                factors={"graph": 0.0, "velocity": 0.0, "behavior": 0.0, "entropy": 0.0},
+                confidence=0.9,
+                breakdown=RiskBreakdown(graph=0.0, velocity=0.0, behavior=0.0, entropy=0.0),
+                explanation="ok",
+                recommended_action="approve",
+                processing_time_ms=1.0,
+                timestamp="2026-01-01T00:00:00Z",
+            )
+
+        original_gather = api_main.asyncio.gather
+
+        async def recording_gather(*args, **kwargs):
+            call_sizes.append(len(args))
+            return await original_gather(*args, **kwargs)
+
+        monkeypatch.setattr(api_main, "check_transaction", fake_check_transaction)
+        monkeypatch.setattr(api_main.asyncio, "gather", recording_gather)
+
+        transactions = [
+            {
+                "transaction_id": f"batch_{i}",
+                "amount": 50.0 * (i + 1),
+                "timestamp": 1234567890.0 + i * 60,
+                "from_account": f"user_{i}",
+                "to_account": f"merchant_{i}",
+                "transaction_type": "payment",
+            }
+            for i in range(17)
+        ]
+
+        response = client.post("/api/v1/fraud/batch", json={"transactions": transactions})
+
+        assert response.status_code == 200
+        assert call_sizes == [8, 8, 1]
+        assert len(response.json()["results"]) == 17
 
 
 class TestCORSandSecurity:

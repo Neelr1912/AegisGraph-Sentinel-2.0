@@ -26,6 +26,7 @@ from ..features.entropy_calculator import compute_entropy_risk_score
 from ..utils.helpers import load_thresholds
 from ..scoring import ThresholdConfig, RiskScorer as CentralRiskScorer
 from ..observability import get_logger
+from ..config import defaults as config_defaults
 
 _inference_logger = get_logger("inference.risk_scorer")
 
@@ -66,25 +67,33 @@ class RiskScorer:
         try:
             threshold_config = load_thresholds('config/thresholds.yaml', validate=True)
             rs = threshold_config.get('risk_scoring', {})
-            self.threshold_block = rs.get('block', 0.90)
-            self.threshold_review = rs.get('review', 0.70)
-            self.threshold_allow = rs.get('allow', 0.50)
+            self.threshold_block = rs.get('block', config_defaults.DEFAULT_RISK_THRESHOLDS["block"])
+            self.threshold_review = rs.get('review', config_defaults.DEFAULT_RISK_THRESHOLDS["review"])
+            self.threshold_allow = rs.get('allow', config_defaults.DEFAULT_RISK_THRESHOLDS["allow"])
             
             # Graph analysis thresholds
             ga = threshold_config.get('graph_analysis', {})
-            self.lateral_movement_std = ga.get('lateral_movement_std_multiplier', 2.0)
-            self.lateral_movement_mult = ga.get('lateral_movement_threshold_multiplier', 3.0)
-            self.lateral_movement_risk_increment = 0.25  # Hardcoded but documented
+            self.lateral_movement_std = ga.get(
+                'lateral_movement_std_multiplier',
+                config_defaults.DEFAULT_LATERAL_MOVEMENT_STD_MULTIPLIER,
+            )
+            self.lateral_movement_mult = ga.get(
+                'lateral_movement_threshold_multiplier',
+                config_defaults.DEFAULT_LATERAL_MOVEMENT_THRESHOLD_MULTIPLIER,
+            )
+            self.lateral_movement_risk_increment = (
+                config_defaults.DEFAULT_LATERAL_MOVEMENT_RISK_INCREMENT
+            )
         except Exception as e:
             logger.error(f"Error: {e}")
             # Fallback to config.yaml
             thresholds = config.get('risk_scoring', {}).get('thresholds', {})
-            self.threshold_block = thresholds.get('block', 0.90)
-            self.threshold_review = thresholds.get('review', 0.70)
-            self.threshold_allow = thresholds.get('allow', 0.50)
-            self.lateral_movement_std = 2.0
-            self.lateral_movement_mult = 3.0
-            self.lateral_movement_risk_increment = 0.25
+            self.threshold_block = thresholds.get('block', config_defaults.DEFAULT_RISK_THRESHOLDS["block"])
+            self.threshold_review = thresholds.get('review', config_defaults.DEFAULT_RISK_THRESHOLDS["review"])
+            self.threshold_allow = thresholds.get('allow', config_defaults.DEFAULT_RISK_THRESHOLDS["allow"])
+            self.lateral_movement_std = config_defaults.DEFAULT_LATERAL_MOVEMENT_STD_MULTIPLIER
+            self.lateral_movement_mult = config_defaults.DEFAULT_LATERAL_MOVEMENT_THRESHOLD_MULTIPLIER
+            self.lateral_movement_risk_increment = config_defaults.DEFAULT_LATERAL_MOVEMENT_RISK_INCREMENT
         
         thresholds = {
             'allow': self.threshold_allow,
@@ -243,6 +252,8 @@ class RiskScorer:
             # Simulate press/release times from hold/flight times
             hold_times = behavioral_data['hold_times']
             flight_times = behavioral_data['flight_times']
+            if not hold_times or not flight_times:
+                return 0.5
             
             press_times = [0.0]
             release_times = [hold_times[0]]
@@ -364,6 +375,7 @@ def compute_risk_score(
     
     # 1. GRAPH-BASED RISK (50% weight)
     graph_risk = 0.0
+    centrality = None
     
     # Check mule accounts even without graph loaded (for demo mode)
     if state.graph_loaded:
@@ -386,22 +398,11 @@ def compute_risk_score(
             graph_risk += 0.3
 
     if state.graph_loaded and state.transaction_graph:
-        # Check if accounts are in known fraud chains
-        if source_account in state.mule_accounts:
-            graph_risk += 0.6
-            _inference_logger.warning(
-                f"Source account {source_account} is a known mule account",
-                event_type="mule_account_detected",
-                metadata={"account": source_account, "role": "source"},
-            )
-        if target_account in state.mule_accounts:
-            graph_risk += 0.4
-            _inference_logger.warning(
-                f"Target account {target_account} is a known mule account",
-                event_type="mule_account_detected",
-                metadata={"account": target_account, "role": "target"},
-            )
-        
+        # Mule-account penalties are applied in the block above.
+        # They are intentionally NOT repeated here — the original code added
+        # them a second time, doubling graph_risk for every mule transaction
+        # and masking all topology signals (fix for Issue #133).
+
         # Check graph topology patterns
         G = state.transaction_graph
         
@@ -448,7 +449,8 @@ def compute_risk_score(
             
             # Betweenness centrality (key intermediary in network)
             try:
-                centrality = nx.betweenness_centrality(G, k=min(100, G.number_of_nodes()))
+                if centrality is None:
+                    centrality = nx.betweenness_centrality(G, k=min(100, G.number_of_nodes()))
                 if source_account in centrality and centrality[source_account] > 0.01:
                     graph_risk += 0.15
                     _inference_logger.warning(
@@ -469,9 +471,10 @@ def compute_risk_score(
     if state.graph_loaded and state.transaction_graph and source_account in state.transaction_graph.nodes:
         G = state.transaction_graph
         try:
-            current_centrality = nx.betweenness_centrality(G, k=min(100, G.number_of_nodes()))
-            if source_account in current_centrality:
-                current_score = current_centrality[source_account]
+            if centrality is None:
+                centrality = nx.betweenness_centrality(G, k=min(100, G.number_of_nodes()))
+            if source_account in centrality:
+                current_score = centrality[source_account]
                 
                 # Get or initialize baseline
                 if source_account not in state.centrality_baseline:
@@ -485,14 +488,14 @@ def compute_risk_score(
                     
                     # Spike detection: configurable thresholds (from thresholds.yaml)
                     spike_threshold = max(
-                        baseline_avg + self.lateral_movement_std * baseline_std,
-                        baseline_avg * self.lateral_movement_mult
+                        baseline_avg + config_defaults.DEFAULT_LATERAL_MOVEMENT_STD_MULTIPLIER * baseline_std,
+                        baseline_avg * config_defaults.DEFAULT_LATERAL_MOVEMENT_THRESHOLD_MULTIPLIER
                     )
                     
                     if current_score > spike_threshold and baseline_avg > 0:
                         lateral_movement_detected = True
                         lateral_movement_reason = f"Lateral movement detected: {source_account} betweenness centrality spiked from baseline {baseline_avg:.4f} to {current_score:.4f} (MITRE ATT&CK TA0008)"
-                        graph_risk += self.lateral_movement_risk_increment
+                        graph_risk += config_defaults.DEFAULT_LATERAL_MOVEMENT_RISK_INCREMENT
                         _inference_logger.warning(
                             f"Lateral movement detected for {source_account}",
                             event_type="lateral_movement",
@@ -601,23 +604,23 @@ def compute_risk_score(
         threshold_data = load_thresholds('config/thresholds.yaml', validate=True)
         rs = threshold_data.get('risk_scoring', {})
         thresholds = {
-            'allow': rs.get('allow', 0.50),
-            'review': rs.get('review', 0.70),
-            'block': rs.get('block', 0.90),
+            'allow': rs.get('allow', config_defaults.DEFAULT_RISK_THRESHOLDS["allow"]),
+            'review': rs.get('review', config_defaults.DEFAULT_RISK_THRESHOLDS["review"]),
+            'block': rs.get('block', config_defaults.DEFAULT_RISK_THRESHOLDS["block"]),
         }
     except Exception as e:
         logger.error(f"Error: {e}")
         thresholds = state.config.get('risk_scoring', {}).get('thresholds', {
-            'allow': 0.50,
-            'review': 0.70,
-            'block': 0.90,
+            'allow': config_defaults.DEFAULT_RISK_THRESHOLDS["allow"],
+            'review': config_defaults.DEFAULT_RISK_THRESHOLDS["review"],
+            'block': config_defaults.DEFAULT_RISK_THRESHOLDS["block"],
         })
 
     component_weights = {
-        'graph': 0.50,
-        'velocity': 0.20,
-        'behavior': 0.20,
-        'entropy': 0.10,
+        'graph': config_defaults.DEFAULT_COMPONENT_WEIGHTS["graph"],
+        'velocity': config_defaults.DEFAULT_COMPONENT_WEIGHTS["velocity"],
+        'behavior': config_defaults.DEFAULT_COMPONENT_WEIGHTS["behavior"],
+        'entropy': config_defaults.DEFAULT_COMPONENT_WEIGHTS["entropy"],
     }
     central_thresholds = ThresholdConfig(thresholds=thresholds)
     central_scorer = CentralRiskScorer(

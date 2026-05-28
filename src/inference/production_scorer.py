@@ -9,6 +9,9 @@ Implements real-time HTGNN-based fraud scoring with:
 - Fallback to heuristics
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -215,13 +218,23 @@ class ProductionRiskScorer:
         Returns:
             List of FraudScores
         """
-        scores = []
-        for i in range(0, len(transactions), batch_size):
-            batch = transactions[i:i+batch_size]
-            for txn in batch:
-                score = self.score_transaction(txn, reference_time)
-                scores.append(score)
-        return scores
+        if not transactions:
+            return []
+
+        max_workers = max(1, min(len(transactions), batch_size, os.cpu_count() or 1))
+        scores: List[Optional[FraudScore]] = [None] * len(transactions)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(self.score_transaction, txn, reference_time): idx
+                for idx, txn in enumerate(transactions)
+            }
+
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                scores[idx] = future.result()
+
+        return [score for score in scores if score is not None]
     
     def _make_decision(self, risk_score: float) -> Tuple[str, float]:
         """
@@ -295,8 +308,19 @@ class ProductionRiskScorer:
         """
         Compute temporal risk (unusual time of day, new account, etc.).
         """
-        # Check if transaction at unusual hours
-        txn_time = datetime.fromisoformat(transaction['timestamp'].isoformat())
+        timestamp = transaction.get('timestamp')
+        if isinstance(timestamp, str):
+            try:
+                txn_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except ValueError:
+                return 0.2
+        elif isinstance(timestamp, (int, float)):
+            txn_time = datetime.fromtimestamp(timestamp)
+        elif hasattr(timestamp, 'isoformat'):
+            txn_time = datetime.fromisoformat(timestamp.isoformat())
+        else:
+            return 0.2
+
         hour = txn_time.hour
         
         # High risk: 2am-4am (common fraud window)

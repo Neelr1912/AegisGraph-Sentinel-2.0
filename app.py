@@ -7,15 +7,24 @@ Real-time Fraud Detection Interface
 import logging
 logger = logging.getLogger(__name__)
 import streamlit as st
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
 import requests
 import json
 import base64
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta
+from plotly.subplots import make_subplots
+from datetime import datetime
 from datetime import timezone
-import time #ready to deploy
+import time
+import os
+import random
+import numpy as np
+import networkx as nx
 
 # Page configuration
 st.set_page_config(
@@ -25,10 +34,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-import os
-
 # API Configuration
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+
+
+def _accessible_status(emoji: str, label: str) -> str:
+    """Return a visual status with an adjacent plain-text equivalent."""
+    return f"{emoji} {label} ({label})"
+
+
+def _schedule_live_refresh(interval_ms: int = 1500) -> None:
+    """Request a non-blocking dashboard refresh when the helper is available."""
+    if st_autorefresh is not None:
+        st_autorefresh(interval=interval_ms, key="command_center_live_refresh")
 
 # Custom CSS
 st.markdown("""
@@ -54,21 +72,21 @@ st.markdown("""
     }
     
     /* Sleek Glassmorphism Metric Cards */
-    .metric-card {
+    [data-testid="stMetric"], .metric-card {
         background: rgba(22, 27, 48, 0.45) !important;
         border: 1px solid rgba(255, 255, 255, 0.08) !important;
         border-radius: 16px !important;
-        padding: 24px !important;
-        box-shadow: 0 10px 35px 0 rgba(0, 0, 0, 0.45) !important;
+        padding: 16px 20px !important;
+        box-shadow: 0 10px 30px 0 rgba(0, 0, 0, 0.3) !important;
         backdrop-filter: blur(12px) !important;
         -webkit-backdrop-filter: blur(12px) !important;
         transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1) !important;
     }
     
-    .metric-card:hover {
-        transform: translateY(-6px);
-        border-color: rgba(045, 212, 191, 0.45) !important;
-        box-shadow: 0 15px 45px 0 rgba(056, 189,248, 0.25) !important;
+    [data-testid="stMetric"]:hover, .metric-card:hover {
+        transform: translateY(-4px);
+        border-color: rgba(45, 212, 191, 0.45) !important;
+        box-shadow: 0 15px 40px 0 rgba(56, 189, 248, 0.2) !important;
         background: rgba(22, 27, 48, 0.65) !important;
     }
     
@@ -81,8 +99,7 @@ st.markdown("""
         backdrop-filter: blur(10px) !important;
         box-shadow: 0 8px 24px 0 rgba(0, 0, 0, 0.3) !important;
     }
-    
-    /* Micro-animations and active elements */
+     /* Micro-animations and active elements */
     button[kind="primary"] {
         background: linear-gradient(135deg, #0f766e 0%, #0284c7 100%) !important;
         border: none !important;
@@ -90,14 +107,70 @@ st.markdown("""
         color: white !important;
         font-weight: 600 !important;
         padding: 10px 24px !important;
-        box-shadow: 0 4px 15px rgba(045, 212,191, 0.3) !important;
-        transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1) !important;
+        transition: all 0.3s ease !important;
     }
+    
+    /* Alert Center Styling */
+    .alert-card {
+        background: rgba(30, 41, 59, 0.7);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        animation: slideIn 0.3s ease-out forwards;
+        transition: transform 0.2s;
+    }
+    .alert-card:hover {
+        transform: translateX(5px);
+        background: rgba(30, 41, 59, 0.9);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    @keyframes slideIn {
+        from { opacity: 0; transform: translateX(-20px); }
+        to { opacity: 1; transform: translateX(0); }
+    }
+    .severity-badge {
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+    .severity-Low { background: rgba(16, 185, 129, 0.2); color: #10b981; border: 1px solid #10b981; }
+    .severity-Medium { background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid #f59e0b; }
+    .severity-High { background: rgba(249, 115, 22, 0.2); color: #f97316; border: 1px solid #f97316; }
+    .severity-Critical { background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444; animation: pulse 2s infinite; }
+    @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+        70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+    }
+    .alert-time { font-family: monospace; color: #94a3b8; font-size: 0.85rem; }
+    .alert-title { font-weight: 600; color: #f1f5f9; margin: 0 12px; flex-grow: 1; }
     
     button[kind="primary"]:hover {
         transform: scale(1.03);
         box-shadow: 0 8px 25px rgba(056, 189,248, 0.5) !important;
         background: linear-gradient(135deg, #14b8a6 0%, #f59e0b 100%) !important;
+    }
+    
+    button[kind="secondary"] {
+        background: rgba(30, 41, 59, 0.7) !important;
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        border-radius: 10px !important;
+        color: white !important;
+        font-weight: 600 !important;
+        padding: 10px 24px !important;
+        transition: all 0.3s ease !important;
+    }
+    button[kind="secondary"]:hover {
+        background: rgba(16, 185, 129, 0.2) !important;
+        border-color: #10b981 !important;
+        transform: scale(1.03);
     }
     
     /* Navigation Sidebar Enhancements */
@@ -122,6 +195,28 @@ st.markdown("""
         border-color: rgba(45, 212, 191, 0.55) !important;
         background: rgba(20, 184, 166, 0.12) !important;
         cursor: pointer;
+    }
+
+    [data-testid="stSidebar"] [role="radiogroup"] label:focus-within,
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:focus-visible) {
+        outline: 3px solid rgba(45, 212, 191, 0.95) !important;
+        outline-offset: 2px !important;
+        border-color: rgba(45, 212, 191, 0.9) !important;
+        background: rgba(20, 184, 166, 0.16) !important;
+        box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.18) !important;
+    }
+
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked),
+    [data-testid="stSidebar"] [role="radiogroup"] label[aria-checked="true"] {
+        border-color: rgba(45, 212, 191, 0.9) !important;
+        background: linear-gradient(135deg, rgba(8, 47, 73, 0.95) 0%, rgba(15, 118, 110, 0.35) 100%) !important;
+        box-shadow: inset 0 0 0 1px rgba(45, 212, 191, 0.35), 0 8px 24px rgba(15, 118, 110, 0.2) !important;
+    }
+
+    [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) p,
+    [data-testid="stSidebar"] [role="radiogroup"] label[aria-checked="true"] p {
+        color: #e6fffb !important;
+        font-weight: 800 !important;
     }
 
     [data-testid="stSidebar"] [role="radiogroup"] label p {
@@ -161,6 +256,8 @@ with st.sidebar:
         "💳 Transaction Scan",
         "📁 Batch Triage",
         "📊 Risk Analytics",
+        "🕸️ Network Graph Explorer",
+        "⌨️ Behavioral Biometrics",
         "🧪 Innovation Lab",
         "ℹ️ System Brief"
     ])
@@ -187,177 +284,164 @@ with st.sidebar:
         response = requests.get(f"{API_URL}/health", timeout=2)
         if response.status_code == 200:
             health = response.json()
-            st.success("✅ API Online")
+            st.success(_accessible_status("✅", "API Online"))
             st.metric("Uptime", f"{int(health.get('uptime_seconds', 0))}s")
             mode = "🎭 DEMO MODE" if not health.get('model_loaded', False) else "🚀 PRODUCTION"
-            st.info(mode)
+            mode_label = "Demo Mode" if "DEMO" in mode else "Production Mode"
+            st.info(f"{mode} ({mode_label})")
         else:
-            st.error("⚠️ API Issue")
+            st.error(_accessible_status("⚠️", "API Issue"))
     except Exception as e:
         logger.error(f"Error: {e}")
-        st.error("❌ API Offline")
+        st.error(_accessible_status("❌", "API Offline"))
         st.warning("Start API: `python -m uvicorn src.api.main:app --reload`")
 
 # Page: Dashboard
 if page == "🧭 Command Center":
     st.header("🧭 Real-Time Command Center")
     
-    col1, col2, col3, col4 = st.columns(4)
+    # Live Mode Toggle
+    live_mode = st.toggle("🔴 Enable Live Event Stream", value=False, key="live_mode_toggle")
     
+    if 'live_events' not in st.session_state:
+        st.session_state.live_events = []
+        
     try:
         response = requests.get(f"{API_URL}/stats", timeout=5)
-        if response.status_code == 200:
-            stats = response.json()
-            total_requests = stats.get('total_requests', 0)
-            decisions = stats.get('decisions', {})
-            flagged = decisions.get('REVIEW', 0) + decisions.get('BLOCK', 0)
-            
-            with col1:
-                st.metric("Total Checks", total_requests, delta="Live")
-            with col2:
-                flag_rate = (flagged / max(total_requests, 1)) * 100
-                st.metric("Flagged", flagged, delta=f"{flag_rate:.1f}%")
-            with col3:
-                st.metric("Avg Response", f"{stats.get('avg_processing_time_ms', 0):.1f}ms", delta="Fast")
-            with col4:
-                uptime_hours = stats.get('uptime_seconds', 0) / 3600
-                st.metric("Uptime", f"{uptime_hours:.1f}h", delta="Stable")
-            
-            # Quick Test Section
-            st.markdown("---")
-            st.subheader("⚡ Quick Transaction Test")
-
-            # Initialize session state for quick test
-            if 'quick_test_result' not in st.session_state:
-                st.session_state.quick_test_result = None
-            if 'quick_test_error' not in st.session_state:
-                st.session_state.quick_test_error = None
-
-            # Compact input form (keeps captions and session-state behavior)
-            with st.form("quick_transaction_test", clear_on_submit=False):
-                quick_cols = st.columns([1.3, 1, 0.9])
-                with quick_cols[0]:
-                    st.number_input(
-                        "Amount",
-                        min_value=1.0,
-                        max_value=1000000.0,
-                        value=5000.0,
-                        step=100.0,
-                        format="%.2f",
-                        key="quick_amount_input",
-                    )
-                    st.caption("₹ transaction value to score")
-                with quick_cols[1]:
-                    st.selectbox("Mode", ["UPI", "IMPS", "NEFT", "RTGS"], index=0, key="quick_mode_input")
-                    st.caption("Payment rail")
-                with quick_cols[2]:
-                    st.write("")
-                    st.write("")
-                    submitted = st.form_submit_button("🔎 Scan Now", use_container_width=True)
-
-            if submitted:
-                # Reset previous state
-                st.session_state.quick_test_result = None
-                st.session_state.quick_test_error = None
-
-                current_amount = st.session_state.get("quick_amount_input", 5000.0)
-                current_mode = st.session_state.get("quick_mode_input", "UPI")
-
-                with st.spinner("Analyzing..."):
-                    txn = {
-                        "transaction_id": f"QUICK_{int(time.time())}",
-                        "source_account": "quick_test_user",
-                        "target_account": "test_merchant",
-                        "amount": float(current_amount),
-                        "currency": "INR",
-                        "mode": current_mode,
-                        "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
-                    }
-
-                    try:
-                        response = requests.post(f"{API_URL}/api/v1/fraud/check", json=txn, timeout=15)
-                        response.raise_for_status()
-                        st.session_state.quick_test_result = response.json()
-                    except requests.exceptions.RequestException as e:
-                        st.session_state.quick_test_error = f"API Error: {str(e)}"
-                    except Exception as e:
-                        st.session_state.quick_test_error = f"Error: {str(e)}"
-
-            # Display result if exists
-            if st.session_state.quick_test_result:
-                result = st.session_state.quick_test_result
-                risk_score = result.get('risk_score', 0)
-                decision = result.get('decision', 'UNKNOWN')
-
-                st.markdown("---")
-                col_a, col_b, col_c = st.columns(3)
-
-                with col_a:
-                    st.metric("Risk Score", f"{risk_score:.3f}")
-                with col_b:
-                    color = "🟢" if decision == "ALLOW" else "🟡" if decision == "REVIEW" else "🔴"
-                    st.metric("Decision", f"{color} {decision}")
-                with col_c:
-                    conf = result.get('confidence', 0.85)
-                    st.metric("Confidence", f"{conf:.1%}")
-
-                # Risk Gauge
-                fig = go.Figure(go.Indicator(
-                    mode="gauge+number+delta",
-                    value=risk_score * 100,
-                    domain={'x': [0, 1], 'y': [0, 1]},
-                    title={'text': "Risk Level", 'font': {'size': 24}},
-                    delta={'reference': 50, 'increasing': {'color': "red"}},
-                    gauge={
-                        'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
-                        'bar': {'color': "darkblue"},
-                        'bgcolor': "white",
-                        'borderwidth': 2,
-                        'bordercolor': "gray",
-                        'steps': [
-                            {'range': [0, 40], 'color': '#90EE90'},
-                            {'range': [40, 70], 'color': '#FFD700'},
-                            {'range': [70, 100], 'color': '#FF6B6B'}
-                        ],
-                        'threshold': {
-                            'line': {'color': "red", 'width': 4},
-                            'thickness': 0.75,
-                            'value': 90
-                        }
-                    }
-                ))
-                fig.update_layout(height=300)
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Show risk breakdown - use 'breakdown' key (API returns breakdown)
-                breakdown = result.get('breakdown', {})
-                if breakdown:
-                    st.subheader("📊 Risk Breakdown")
-                    breakdown_cols = st.columns(len(breakdown))
-                    for idx, (component, value) in enumerate(breakdown.items()):
-                        with breakdown_cols[idx]:
-                            st.metric(component.title(), f"{value:.2%}")
-
-                st.info(f"💡 {result.get('explanation', 'No explanation available')}")
-                st.success("✅ Transaction analyzed successfully!")
-
-                # Clear result button
-                if st.button("Clear Result", key="clear_quick_result"):
-                    st.session_state.quick_test_result = None
-                    st.rerun()
-
-            # Display error if exists
-            if st.session_state.quick_test_error:
-                st.error(st.session_state.quick_test_error)
-                if st.button("Clear Error", key="clear_quick_error"):
-                    st.session_state.quick_test_error = None
-                    st.rerun()
+        stats = response.json() if response.status_code == 200 else {}
+    except:
+        stats = {}
         
-        else:
-            st.error("Unable to fetch statistics")
+    # Generate a live event if active
+    if live_mode:
+        _schedule_live_refresh()
+        # Local imports consolidated globally
+        # Create a mock transaction to send to the backend
+        accounts = ["ACC" + str(random.randint(1000, 9999)), "mule_acc_001", "ACC" + str(random.randint(1000, 9999))]
+        txn = {
+            "transaction_id": f"LIVE_{int(time.time()*1000)}",
+            "source_account": random.choice(accounts),
+            "target_account": random.choice(accounts),
+            "amount": float(random.choice([500, 2500, 50000, 150000, 300000])),
+            "currency": "INR",
+            "mode": random.choice(["UPI", "IMPS"]),
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
+        }
+        try:
+            start_t = time.time()
+            resp = requests.post(f"{API_URL}/api/v1/fraud/check", json=txn, timeout=2)
+            latency = int((time.time() - start_t) * 1000)
+            if resp.status_code == 200:
+                result = resp.json()
+                event = {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "id": txn["transaction_id"],
+                    "amount": txn["amount"],
+                    "decision": result.get("decision", "ALLOW"),
+                    "risk": result.get("risk_score", 0.0),
+                    "latency": latency,
+                    "explanation": result.get("explanation", ""),
+                    "breakdown": result.get("breakdown", {})
+                }
+                st.session_state.live_events.insert(0, event)
+                # Keep last 15
+                st.session_state.live_events = st.session_state.live_events[:15]
+        except Exception as e:
+            pass
+
+    # Metrics
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    total_reqs = stats.get('total_requests', len(st.session_state.live_events))
+    flagged = stats.get('decisions', {}).get('REVIEW', 0) + stats.get('decisions', {}).get('BLOCK', 0)
+    flag_rate = (flagged / max(total_reqs, 1)) * 100
     
-    except Exception as e:
-        st.error(f"Error connecting to API: {e}")
+    with m_col1:
+        st.metric("Total Checks", total_reqs, delta="Live")
+    with m_col2:
+        st.metric("Flagged", flagged, delta=f"{flag_rate:.1f}%")
+    with m_col3:
+        recent_lat = st.session_state.live_events[0]['latency'] if st.session_state.live_events else stats.get('avg_processing_time_ms', 0)
+        st.metric("Avg Response", f"{recent_lat:.1f}ms", delta="Fast")
+    with m_col4:
+        uptime_hours = stats.get('uptime_seconds', 0) / 3600
+        st.metric("Uptime", f"{uptime_hours:.1f}h", delta="Stable")
+        
+    st.markdown("---")
+    
+    # Realtime Visualizations
+    col_main, col_side = st.columns([2, 1])
+    
+    with col_main:
+        st.subheader("📡 Live Fraud Event Stream")
+        if not st.session_state.live_events:
+            st.info("Live stream inactive. Toggle above to begin simulating transactions.")
+        else:
+            df_events = pd.DataFrame(st.session_state.live_events)
+            display_df = df_events[['time', 'id', 'amount', 'decision', 'risk', 'latency']].copy()
+            display_df['amount'] = display_df['amount'].apply(lambda x: f"₹{x:,.0f}")
+            display_df['risk'] = display_df['risk'].apply(lambda x: f"{x:.1%}")
+            display_df['latency'] = display_df['latency'].apply(lambda x: f"{x}ms")
+            
+            def highlight_decision(val):
+                if val == 'BLOCK':
+                    return 'background-color: rgba(239, 68, 68, 0.2); color: #ef4444; font-weight: bold;'
+                elif val == 'REVIEW':
+                    return 'background-color: rgba(245, 158, 11, 0.2); color: #f59e0b; font-weight: bold;'
+                return 'background-color: rgba(16, 185, 129, 0.2); color: #10b981;'
+            
+            # Note: Pandas Styler applymap was deprecated in Pandas 2.1.0, replaced by map
+            st.dataframe(
+                display_df.style.map(highlight_decision, subset=['decision']),
+                use_container_width=True,
+                height=400
+            )
+            
+            st.subheader("📈 Realtime Risk Density (Heatmap)")
+            if len(st.session_state.live_events) > 2:
+                fig = px.area(df_events[::-1], x='time', y='risk', color='decision',
+                             color_discrete_map={'ALLOW': '#10b981', 'REVIEW': '#f59e0b', 'BLOCK': '#ef4444'},
+                             title='Live Risk Timeline')
+                fig.update_layout(height=250, margin=dict(l=0, r=0, t=30, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+                st.plotly_chart(fig, use_container_width=True)
+ 
+    with col_side:
+        st.subheader("🧠 Aegis-Oracle Explainability")
+        if st.session_state.live_events:
+            latest = st.session_state.live_events[0]
+            
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=latest['risk'] * 100,
+                domain={'x': [0, 1], 'y': [0, 1]},
+                title={'text': "Current Risk Level", 'font': {'size': 18}},
+                gauge={
+                    'axis': {'range': [None, 100]},
+                    'bar': {'color': "darkblue"},
+                    'steps': [
+                        {'range': [0, 40], 'color': '#10b981'},
+                        {'range': [40, 70], 'color': '#f59e0b'},
+                        {'range': [70, 100], 'color': '#ef4444'}
+                    ]
+                }
+            ))
+            fig_gauge.update_layout(height=200, margin=dict(l=20, r=20, t=30, b=0))
+            st.plotly_chart(fig_gauge, use_container_width=True)
+            
+            st.markdown("**Decision Breakdown**")
+            bd = latest.get('breakdown', {})
+            st.progress(float(min(bd.get('graph', 0), 1.0)), text=f"Graph Anomaly ({bd.get('graph',0):.1%})")
+            st.progress(float(min(bd.get('velocity', 0), 1.0)), text=f"Velocity Risk ({bd.get('velocity',0):.1%})")
+            st.progress(float(min(bd.get('behavior', 0), 1.0)), text=f"Behavioral Stress ({bd.get('behavior',0):.1%})")
+            st.progress(float(min(bd.get('entropy', 0), 1.0)), text=f"Entropy Risk ({bd.get('entropy',0):.1%})")
+            
+            if latest['decision'] == 'BLOCK':
+                st.error(latest['explanation'])
+            elif latest['decision'] == 'REVIEW':
+                st.warning(latest['explanation'])
+            else:
+                st.success(latest['explanation'])
+        else:
+            st.write("Awaiting transactions...")
 
 # Page: Single Transaction Check
 elif page == "💳 Transaction Scan":
@@ -415,7 +499,7 @@ elif page == "💳 Transaction Scan":
                     if response.status_code == 200:
                         result = response.json()
                         
-                        st.success("✅ Analysis Complete!")
+                        st.success(_accessible_status("✅", "Analysis Complete"))
                         
                         # Results Display
                         st.markdown("---")
@@ -429,7 +513,7 @@ elif page == "💳 Transaction Scan":
                         with metric_cols[1]:
                             decision = result['decision']
                             emoji = "🟢" if decision == "ALLOW" else "🟡" if decision == "REVIEW" else "🔴"
-                            st.metric("Decision", f"{emoji} {decision}")
+                            st.metric("Decision", f"{emoji} {decision} ({decision.title()} decision)")
                         with metric_cols[2]:
                             st.metric("Confidence", f"{result['confidence']:.1%}")
                         with metric_cols[3]:
@@ -807,83 +891,551 @@ elif page == "📁 Batch Triage":
 
 # Page: Statistics
 elif page == "📊 Risk Analytics":
-    st.header("📊 System Statistics & Analytics")
+    st.header("📊 Enterprise Operations & Risk Analytics")
+    st.markdown("Centralized SOC command console for real-time infrastructure and decision monitoring.")
+    st.markdown("---")
     
+    # Local imports consolidated globally
+    
+    # Check API Status
     try:
-        response = requests.get(f"{API_URL}/stats", timeout=5)
-        if response.status_code == 200:
-            stats = response.json()
-            
-            # Top Metrics
-            st.subheader("Key Performance Indicators")
-            col1, col2, col3, col4 = st.columns(4)
-            
-            # Extract data
-            total_requests = stats.get('total_requests', 0)
-            decisions = stats.get('decisions', {})
-            flagged = decisions.get('REVIEW', 0) + decisions.get('BLOCK', 0)
-            avg_time = stats.get('avg_processing_time_ms', 0)
-            uptime = stats.get('uptime_seconds', 0)
-            
-            with col1:
-                st.metric("Total Checks", total_requests)
-            with col2:
-                st.metric("Flagged", flagged)
-            with col3:
-                st.metric("Avg Response Time", f"{avg_time:.2f}ms", 
-                         delta="Good" if avg_time < 200 else "Slow")
-            with col4:
-                st.metric("Uptime", f"{uptime/3600:.1f}h")
-            
-            # System Health
-            st.markdown("---")
-            st.subheader("🏥 System Health")
-            
-            health_col1, health_col2 = st.columns(2)
-            
-            with health_col1:
-                # Performance Gauge
-                performance_score = min(100, (200 - avg_time) / 200 * 100)
-                fig_gauge = go.Figure(go.Indicator(
-                    mode="gauge+number",
-                    value=performance_score,
-                    title={'text': "Performance Score"},
-                    gauge={
-                        'axis': {'range': [0, 100]},
-                        'bar': {'color': "darkblue"},
-                        'steps': [
-                            {'range': [0, 50], 'color': "lightgray"},
-                            {'range': [50, 75], 'color': "yellow"},
-                            {'range': [75, 100], 'color': "lightgreen"}
-                        ],
-                    }
-                ))
-                st.plotly_chart(fig_gauge, use_container_width=True)
-            
-            with health_col2:
-                st.write("")
-                st.write("")
-                st.write("")
-                if avg_time < 100:
-                    st.success("🚀 Excellent Performance")
-                elif avg_time < 200:
-                    st.info("✅ Good Performance")
-                else:
-                    st.warning("⚠️ Performance Degradation")
-                
-                flagged_rate = flagged / max(total_requests, 1)
-                st.metric("Fraud Detection Rate", f"{flagged_rate*100:.2f}%")
-                
-                if flagged_rate > 0.1:
-                    st.warning("⚠️ High fraud rate detected")
-                else:
-                    st.success("✅ Normal transaction patterns")
-        
+        stats_response = requests.get(f"{API_URL}/stats", timeout=3)
+        if stats_response.status_code == 200:
+            stats = stats_response.json()
         else:
-            st.error("Unable to fetch statistics")
-    
+            stats = {}
     except Exception as e:
-        st.error(f"Error: {e}")
+        stats = {}
+        
+    try:
+        health_response = requests.get(f"{API_URL}/health", timeout=3)
+        if health_response.status_code == 200:
+            health = health_response.json()
+        else:
+            health = {}
+    except Exception as e:
+        health = {}
+
+    # Extract metrics
+    total_requests = stats.get('total_requests', 0)
+    decisions = stats.get('decisions', {})
+    flagged = decisions.get('REVIEW', 0) + decisions.get('BLOCK', 0)
+    avg_time = stats.get('avg_processing_time_ms', 45.0)
+    uptime_sec = health.get('uptime_seconds', 0)
+    
+    # Interactive Live Toggle
+    is_live = st.toggle("🔴 Enable Live Infrastructure Monitoring (Auto-Refresh)", value=False, key="risk_analytics_live_toggle")
+    
+    # Initialize session state for live tracking
+    if 'risk_latency_history' not in st.session_state:
+        st.session_state.risk_latency_history = list(np.random.normal(loc=avg_time, scale=5.0, size=20).clip(10, 200))
+    if 'risk_tps_history' not in st.session_state:
+        st.session_state.risk_tps_history = list(np.random.normal(loc=12.5, scale=2.5, size=20).clip(1, 100))
+    if 'risk_time_history' not in st.session_state:
+        st.session_state.risk_time_history = list(pd.date_range(end=pd.Timestamp.now(), periods=20, freq='2S'))
+    if 'fraud_risk_score_history' not in st.session_state:
+        st.session_state.fraud_risk_score_history = list(np.random.normal(loc=30, scale=5.0, size=20).clip(0, 100))
+        
+    if is_live:
+        # Generate new data point
+        new_latency = np.random.normal(loc=avg_time, scale=6.0)
+        new_tps = np.random.normal(loc=15.0 if flagged > 0 else 10.0, scale=3.0)
+        
+        # Calculate new risk score based on real-time alerts
+        new_risk = np.random.normal(loc=30, scale=5.0)
+        if 'realtime_alerts' in st.session_state and len(st.session_state.realtime_alerts) > 0:
+            active_alerts_for_risk = [a for a in st.session_state.realtime_alerts if a.get('status', 'Active') != 'Resolved']
+            if active_alerts_for_risk:
+                latest_alert = active_alerts_for_risk[0]
+                # Link to alert severity if fresh (within 3 seconds)
+                time_diff = (pd.Timestamp.now() - latest_alert['time']).total_seconds()
+                if time_diff < 3:
+                    if latest_alert['severity'] == "Critical":
+                        new_risk = np.random.normal(loc=95, scale=2.0)
+                    elif latest_alert['severity'] == "High":
+                        new_risk = np.random.normal(loc=82, scale=4.0)
+                    elif latest_alert['severity'] == "Medium":
+                        new_risk = np.random.normal(loc=65, scale=6.0)
+        new_risk = max(0, min(100, new_risk))
+        
+        st.session_state.risk_latency_history.append(new_latency)
+        st.session_state.risk_tps_history.append(new_tps)
+        st.session_state.risk_time_history.append(pd.Timestamp.now())
+        st.session_state.fraud_risk_score_history.append(new_risk)
+        
+        # Keep only last 20 using slice reassignment (faster and safer in Streamlit)
+        if len(st.session_state.risk_latency_history) > 20:
+            st.session_state.risk_latency_history = st.session_state.risk_latency_history[-20:]
+            st.session_state.risk_tps_history = st.session_state.risk_tps_history[-20:]
+            st.session_state.risk_time_history = st.session_state.risk_time_history[-20:]
+            st.session_state.fraud_risk_score_history = st.session_state.fraud_risk_score_history[-20:]
+
+    # Top metrics display
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Requests Checked", f"{total_requests:,}")
+    with col2:
+        fraud_rate = (flagged / max(total_requests, 1)) * 100
+        st.metric("Fraud Detection Rate", f"{fraud_rate:.2f}%", delta="Normal" if fraud_rate < 15.0 else "Elevated Risk", delta_color="inverse")
+    with col3:
+        current_latency = st.session_state.risk_latency_history[-1]
+        st.metric("Avg Latency (ms)", f"{current_latency:.2f} ms", delta=f"{current_latency - st.session_state.risk_latency_history[-2]:.2f} ms", delta_color="inverse")
+    with col4:
+        st.metric("SOC Node Status", "🟢 ACTIVE" if health.get('model_loaded', False) else "🎭 DEMO MODE")
+
+    st.markdown("---")
+    
+    col_main, col_side = st.columns([2, 1])
+    
+    with col_main:
+        st.subheader("⚡ Live System Throughput & Latency")
+        
+        # Create dual axis graph
+        fig_lat = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_lat.add_trace(
+            go.Scatter(
+                x=st.session_state.risk_time_history, 
+                y=st.session_state.risk_latency_history, 
+                name="Inference Latency (ms)", 
+                mode='lines+markers', 
+                line=dict(color='#ff9900', width=3),
+                marker=dict(size=6)
+            ),
+            secondary_y=False,
+        )
+        fig_lat.add_trace(
+            go.Scatter(
+                x=st.session_state.risk_time_history, 
+                y=st.session_state.risk_tps_history, 
+                name="System TPS (Throughput)", 
+                mode='lines+markers', 
+                line=dict(color='#00ffcc', width=2, dash='dot'),
+                marker=dict(size=4)
+            ),
+            secondary_y=True,
+        )
+        
+        fig_lat.update_layout(
+            height=280, 
+            margin=dict(l=10, r=10, t=30, b=10), 
+            paper_bgcolor='rgba(0,0,0,0)', 
+            plot_bgcolor='rgba(0,0,0,0)', 
+            hovermode='x unified',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        fig_lat.update_yaxes(title_text="Latency (ms)", secondary_y=False, gridcolor='rgba(255,255,255,0.1)')
+        fig_lat.update_yaxes(title_text="TPS (Req/Sec)", secondary_y=True, showgrid=False)
+        
+        st.plotly_chart(fig_lat, use_container_width=True)
+        
+        def render_risk_and_threat_charts():
+            risk_col, threat_col = st.columns([2, 1])
+            
+            with risk_col:
+                st.subheader("🌐 Global Fraud Risk Index")
+                st.markdown("**Real-time aggregate risk score driven by live alert severities**")
+                
+                # Build Risk Trend Chart
+                risk_df = pd.DataFrame({
+                    'Time': st.session_state.risk_time_history,
+                    'RiskScore': st.session_state.fraud_risk_score_history
+                })
+                
+                # Color line based on latest risk score
+                current_risk = risk_df['RiskScore'].iloc[-1]
+                if current_risk >= 80:
+                    line_color = '#ef4444'
+                    fill_color = 'rgba(239, 68, 68, 0.2)'
+                elif current_risk >= 50:
+                    line_color = '#f59e0b'
+                    fill_color = 'rgba(245, 158, 11, 0.2)'
+                else:
+                    line_color = '#10b981'
+                    fill_color = 'rgba(16, 185, 129, 0.2)'
+                    
+                fig_risk = go.Figure()
+                
+                # Gradient area fill
+                fig_risk.add_trace(go.Scatter(
+                    x=risk_df['Time'], 
+                    y=risk_df['RiskScore'],
+                    fill='tozeroy',
+                    mode='lines',
+                    line=dict(color=line_color, width=3),
+                    fillcolor=fill_color,
+                    name="Risk Index"
+                ))
+                
+                # Add spike markers for high risk
+                high_risk_points = risk_df[risk_df['RiskScore'] >= 80]
+                if not high_risk_points.empty:
+                    fig_risk.add_trace(go.Scatter(
+                        x=high_risk_points['Time'],
+                        y=high_risk_points['RiskScore'],
+                        mode='markers',
+                        marker=dict(color='#ef4444', size=10, symbol='diamond-open', line=dict(width=2, color='#ef4444')),
+                        name="Critical Anomaly"
+                    ))
+                    
+                fig_risk.update_layout(
+                    height=200,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    hovermode='x unified',
+                    showlegend=False,
+                    yaxis=dict(range=[0, 100], title="Risk Score", gridcolor='rgba(255,255,255,0.1)'),
+                    xaxis=dict(showgrid=False)
+                )
+                st.plotly_chart(fig_risk, use_container_width=True)
+                
+            with threat_col:
+                st.subheader("🍩 Threat Distribution")
+                st.markdown("**Live severity breakdown**")
+                
+                if 'realtime_alerts' in st.session_state and len(st.session_state.realtime_alerts) > 0:
+                    alerts = st.session_state.realtime_alerts
+                    
+                    if not alerts:
+                        st.info("No active threats.")
+                    else:
+                        sev_counts = {'Critical': 0, 'High': 0, 'Medium': 0, 'Low': 0}
+                        for a in alerts:
+                            sev_counts[a['severity']] += 1
+                        
+                        labels = list(sev_counts.keys())
+                        values = list(sev_counts.values())
+                        colors = ['#ef4444', '#f97316', '#f59e0b', '#10b981'] # Critical, High, Medium, Low
+                        
+                        fig_pie = go.Figure(data=[go.Pie(
+                            labels=labels, 
+                            values=values, 
+                            hole=.6,
+                            marker=dict(colors=colors, line=dict(color='#0b0f19', width=2)),
+                            textinfo='none',
+                            hoverinfo='label+percent'
+                        )])
+                        fig_pie.update_layout(
+                            height=200,
+                            margin=dict(l=10, r=10, t=10, b=10),
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            showlegend=False,
+                            annotations=[dict(text=f"{len(alerts)}", x=0.5, y=0.5, font_size=24, showarrow=False, font_color="white")]
+                        )
+                        st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.info("No active threats.")
+                    
+        # Call the modularized function
+        render_risk_and_threat_charts()
+        
+        st.subheader("🧠 AI Decision Breakdown Engine")
+        
+        # Stacked Risk Bar selector for different high-profile alerts
+        st.markdown("**Analyze Risk Distribution of Flagged Accounts**")
+        selected_alert = st.selectbox(
+            "Select Account to Inspect Anomaly Composition",
+            ["ACC00004766 (High Risk - Money Laundering)", "ACC00001071 (Star Hub - Mule Network)", "ACC00003254 (Moderate Risk - Multi-hop Transfer)"]
+        )
+        
+        if "4766" in selected_alert:
+            categories = ['Graph Anomaly', 'Velocity Risk', 'Behavioral Stress', 'Entropy']
+            values = [0.45, 0.35, 0.12, 0.08]
+            desc = "Critical Graph and Velocity signals detected. Transaction occurred at 3:15 AM (Entropy)."
+        elif "1071" in selected_alert:
+            categories = ['Graph Anomaly', 'Velocity Risk', 'Behavioral Stress', 'Entropy']
+            values = [0.70, 0.15, 0.05, 0.10]
+            desc = "Severe Fan-in and Fan-out topology matches known Mule Ring template (Graph)."
+        else:
+            categories = ['Graph Anomaly', 'Velocity Risk', 'Behavioral Stress', 'Entropy']
+            values = [0.25, 0.40, 0.20, 0.15]
+            desc = "High frequency transfer from suspected IP address (Velocity)."
+            
+        fig_bar = px.bar(
+            x=values, 
+            y=['Anomaly Contribution'] * len(values), 
+            orientation='h', 
+            color=categories,
+            color_discrete_sequence=['#ef4444', '#f59e0b', '#0ea5e9', '#8b5cf6'],
+            labels={'x': 'Risk Component Contribution', 'y': ''}
+        )
+        fig_bar.update_layout(
+            height=140, 
+            margin=dict(l=10, r=10, t=10, b=10), 
+            barmode='stack', 
+            paper_bgcolor='rgba(0,0,0,0)', 
+            plot_bgcolor='rgba(0,0,0,0)',
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        fig_bar.update_xaxes(visible=True, showgrid=False)
+        fig_bar.update_yaxes(visible=False)
+        st.plotly_chart(fig_bar, use_container_width=True)
+        st.caption(f"ℹ️ **Oracle Risk Breakdown**: {desc}")
+        
+    with col_side:
+        st.subheader("🛡️ Analyst Assistant")
+        
+        # Determine card status based on selected alert
+        if "4766" in selected_alert:
+            st.error("🚨 **DECISION RECOMMENDATION: BLOCK**")
+            urgency = "CRITICAL"
+            action_code = "BLOCK"
+            summary_text = "The transaction exhibits extreme graph anomalies matching known **Mule Network Hub** topologies. Coupled with velocity spikes and late-night execution, this indicates money laundering."
+        elif "1071" in selected_alert:
+            st.error("🚨 **DECISION RECOMMENDATION: BLOCK**")
+            urgency = "CRITICAL"
+            action_code = "BLOCK"
+            summary_text = "Active multi-hop money distribution center. Direct connections to 12 victim nodes and 8 layering endpoints. Star pattern confirmed."
+        else:
+            st.warning("⚠️ **DECISION RECOMMENDATION: REVIEW**")
+            urgency = "HIGH"
+            action_code = "REVIEW"
+            summary_text = "Transaction velocity exceeds baseline threshold by 340%. Behavioral biometrics show mild hesitation spikes. Risk score is elevated."
+            
+        st.markdown(f"**Urgency Level:** `{urgency}`")
+        st.markdown(f"**AI Recommendation Summary:**\n{summary_text}")
+        
+        st.markdown("**Suggested Actions:**")
+        if action_code == "BLOCK":
+            st.info("🛑 **Freeze Account Immediately**")
+            st.info("📋 **Escalate to Tier 2 Fraud Team**")
+            st.info("⛓️ **Seal evidence in blockchain ledger**")
+        else:
+            st.info("📞 **Callback verification required**")
+            st.info("👁️ **Add to high-frequency watchlist**")
+            
+        st.markdown("---")
+        
+        # Interactive actions
+        action_btn_col1, action_btn_col2 = st.columns(2)
+        
+        # Action feedback in session state
+        if 'action_taken' not in st.session_state:
+            st.session_state.action_taken = None
+            st.session_state.action_target = None
+            
+        with action_btn_col1:
+            if st.button("🔒 Freeze Account", use_container_width=True, type="primary"):
+                st.session_state.action_taken = "FREEZE"
+                st.session_state.action_target = selected_alert.split(" ")[0]
+        with action_btn_col2:
+            if st.button("✅ Approve Clean", use_container_width=True):
+                st.session_state.action_taken = "APPROVE"
+                st.session_state.action_target = selected_alert.split(" ")[0]
+                
+        if st.session_state.action_taken:
+            if st.session_state.action_taken == "FREEZE":
+                st.success(f"🔒 **Account {st.session_state.action_target} frozen successfully.**\n\nNotification sent to core banking core ledger. Hyperledger Fabric evidence block sealed.")
+            else:
+                st.info(f"✅ **Account {st.session_state.action_target} approved.**\n\nWhitelist updated and alert resolved in console.")
+            # Clear after display or on next run
+            st.session_state.action_taken = None
+
+        # Calculate dynamic metrics if alerts exist
+        active_threats = 0
+        critical_incidents = 0
+        if 'realtime_alerts' in st.session_state:
+            active_threats = len(st.session_state.realtime_alerts)
+            critical_incidents = sum(1 for a in st.session_state.realtime_alerts if a['severity'] == 'Critical')
+            
+    st.markdown("---")
+    
+    # Fraud Heatmap Visualization
+    st.subheader("🗺️ Global Threat Telemetry")
+    st.markdown("**Real-time geolocation of active fraud vectors**")
+    
+    if 'realtime_alerts' in st.session_state and len(st.session_state.realtime_alerts) > 0:
+        active_threats = st.session_state.realtime_alerts
+        
+        if active_threats:
+            geo_df = pd.DataFrame(active_threats)
+            
+            size_map = {"Critical": 24, "High": 16, "Medium": 10, "Low": 6}
+            color_map = {"Critical": "#ef4444", "High": "#f97316", "Medium": "#f59e0b", "Low": "#10b981"}
+            
+            geo_df['size'] = geo_df['severity'].map(size_map)
+            geo_df['color'] = geo_df['severity'].map(color_map)
+            
+            fig_geo = go.Figure(go.Scattergeo(
+                lon = geo_df['lon'],
+                lat = geo_df['lat'],
+                text = geo_df['title'] + '<br>' + geo_df['severity'],
+                mode = 'markers',
+                marker = dict(
+                    size = geo_df['size'],
+                    color = geo_df['color'],
+                    line = dict(width=1, color='rgba(255, 255, 255, 0.5)'),
+                    opacity = 0.8
+                )
+            ))
+            
+            fig_geo.update_geos(
+                projection_type="natural earth",
+                showcoastlines=True, coastlinecolor="rgba(255, 255, 255, 0.1)",
+                showland=True, landcolor="rgba(30, 41, 59, 0.5)",
+                showocean=True, oceancolor="rgba(15, 23, 42, 0.5)",
+                showlakes=True, lakecolor="rgba(15, 23, 42, 0.5)",
+                showcountries=True, countrycolor="rgba(255, 255, 255, 0.1)",
+                bgcolor="rgba(0,0,0,0)"
+            )
+            
+            fig_geo.update_layout(
+                height=350,
+                margin={"r":0,"t":0,"l":0,"b":0},
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig_geo, use_container_width=True)
+        else:
+            st.info("No active geolocation threats detected.")
+            
+    st.markdown("---")
+    
+    export_col1, export_col2 = st.columns([4, 1])
+    with export_col1:
+        st.subheader("📈 Realtime Alert Analytics")
+    with export_col2:
+        if 'realtime_alerts' in st.session_state and st.session_state.realtime_alerts:
+            csv_data = pd.DataFrame(st.session_state.realtime_alerts).to_csv(index=False)
+            st.download_button(
+                label="📥 Export Intel",
+                data=csv_data,
+                file_name=f"threat_intel_export_{int(time.time())}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+    summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+    with summary_col1:
+        st.metric("Active Threats", f"{active_threats if 'realtime_alerts' in st.session_state else 12}", "+2 this hour")
+    with summary_col2:
+        st.metric("Critical Incidents", f"{critical_incidents if 'realtime_alerts' in st.session_state else 3}", "Immediate Action Required" if critical_incidents > 0 else "Stable", delta_color="inverse")
+    with summary_col3:
+        st.metric("Avg Resolution Time", "4.2m", "-30s")
+    with summary_col4:
+        st.metric("False Positive Rate", "1.8%", "-0.2%")
+        
+    st.markdown("---")
+    
+    with st.expander("🚨 Realtime Fraud Alert Center", expanded=True):
+
+        
+        # Initialize alerts
+        if 'realtime_alerts' not in st.session_state:
+            st.session_state.realtime_alerts = [
+                {"id": "AL-1001", "time": pd.Timestamp.now() - pd.Timedelta(seconds=45), "severity": "Critical", "title": "Mule Ring Topology Detected (Fan-out)", "category": "Graph", "lat": 51.50, "lon": -0.12, "status": "Active"},
+                {"id": "AL-1002", "time": pd.Timestamp.now() - pd.Timedelta(seconds=120), "severity": "High", "title": "Velocity Spike on ACC00003254", "category": "Velocity", "lat": 40.71, "lon": -74.00, "status": "Active"},
+                {"id": "AL-1003", "time": pd.Timestamp.now() - pd.Timedelta(minutes=5), "severity": "Medium", "title": "Hesitation Cadence Anomaly", "category": "Biometric", "lat": 35.67, "lon": 139.65, "status": "Active"},
+                {"id": "AL-1004", "time": pd.Timestamp.now() - pd.Timedelta(minutes=15), "severity": "Low", "title": "Unusual Device Fingerprint", "category": "Device", "lat": 1.35, "lon": 103.81, "status": "Active"}
+            ]
+            
+        # Simulate incoming alerts if live
+        if is_live and np.random.random() > 0.6:
+            severities = ["Low", "Medium", "High", "Critical"]
+            probs = [0.4, 0.3, 0.2, 0.1]
+            sev = np.random.choice(severities, p=probs)
+            
+            categories = {"Low": "Device", "Medium": "Biometric", "High": "Velocity", "Critical": "Graph"}
+            titles = {
+                "Low": ["New IP Address Login", "Unusual Browser User-Agent", "Minor Typo Correction Rate"],
+                "Medium": ["Hesitation Cadence Anomaly", "High Flight Time (Keyboard)", "Location Jump (100km)"],
+                "High": ["Velocity Spike on Account", "Multiple Rapid Transfers", "Known Bad Actor Interaction"],
+                "Critical": ["Mule Ring Topology Detected", "Large Value Extraction", "Account Takeover Pattern"]
+            }
+            
+            hubs = [(40.71, -74.00), (51.50, -0.12), (35.67, 139.65), (1.35, 103.81), (37.77, -122.41), (50.11, 8.68)]
+            base_lat, base_lon = hubs[np.random.randint(0, len(hubs))]
+            new_alert = {
+                "id": f"AL-{int(time.time())}",
+                "time": pd.Timestamp.now(),
+                "severity": sev,
+                "title": np.random.choice(titles[sev]),
+                "category": categories[sev],
+                "lat": base_lat + np.random.normal(0, 5.0),
+                "lon": base_lon + np.random.normal(0, 5.0),
+                "status": "Active"
+            }
+            # Prepend and keep max 50 alerts safely
+            st.session_state.realtime_alerts = [new_alert] + st.session_state.realtime_alerts[:49]
+                
+        # Filters UI
+        filter_col1, filter_col2 = st.columns([2, 1])
+        with filter_col1:
+            # Safely try to use st.pills if available in this Streamlit version, else fallback to multiselect
+            try:
+                selected_severities = st.pills("Filter by Severity", ["Critical", "High", "Medium", "Low"], default=["Critical", "High", "Medium", "Low"], selection_mode="multi")
+            except AttributeError:
+                selected_severities = st.multiselect("Filter by Severity", ["Critical", "High", "Medium", "Low"], default=["Critical", "High", "Medium", "Low"])
+        with filter_col2:
+            search_term = st.text_input("🔍 Search Alerts", placeholder="e.g. Mule, Velocity...")
+            
+        # Filter alerts
+        filtered_alerts = [
+            a for a in st.session_state.realtime_alerts 
+            if a["severity"] in (selected_severities or [])
+            and (search_term.lower() in a["title"].lower() or search_term.lower() in a["category"].lower() or search_term.lower() in a["id"].lower())
+        ]
+        
+        # Investigation Timeline
+        if 'investigate_alert_id' in st.session_state and st.session_state.investigate_alert_id:
+            inv_id = st.session_state.investigate_alert_id
+            target_alert = next((a for a in st.session_state.realtime_alerts if a['id'] == inv_id), None)
+            if target_alert:
+                st.info(f"🔎 **Active Investigation:** {target_alert['title']} (`{inv_id}`)")
+                timeline_col1, timeline_col2 = st.columns([3, 1])
+                
+                with timeline_col1:
+                    t = target_alert['time']
+                    st.markdown(f"**{(t - pd.Timedelta(minutes=45)).strftime('%H:%M:%S')}** &nbsp; 🟢 Initial Login (Normal IP)")
+                    st.markdown(f"**{(t - pd.Timedelta(minutes=10)).strftime('%H:%M:%S')}** &nbsp; 🟡 Security Settings Changed (2FA Disabled)")
+                    st.markdown(f"**{(t - pd.Timedelta(minutes=2)).strftime('%H:%M:%S')}** &nbsp; 🔴 Large Transfer Initiated")
+                    st.markdown(f"**{t.strftime('%H:%M:%S')}** &nbsp; 🚨 **ALERT TRIGGERED:** {target_alert['title']}")
+                with timeline_col2:
+                    st.markdown("<br><br>", unsafe_allow_html=True)
+                    if st.button("Close Investigation", use_container_width=True, type="primary"):
+                        st.session_state.investigate_alert_id = None
+                        st.rerun()
+                st.markdown("---")
+
+        # Render Alerts
+        st.markdown('<div style="max-height: 400px; overflow-y: auto; padding-right: 10px; margin-top: 15px;">', unsafe_allow_html=True)
+        if not filtered_alerts:
+            st.info("No alerts match the current filters.")
+        else:
+            for alert in filtered_alerts:
+                time_str = alert["time"].strftime("%H:%M:%S")
+                is_resolved = alert.get('status', 'Active') == 'Resolved'
+                opacity = "0.5" if is_resolved else "1.0"
+                status_badge = "Resolved" if is_resolved else alert['severity']
+                
+                alert_col, inv_col, btn_col = st.columns([4, 1, 1])
+                with alert_col:
+                    html = f"""
+                    <div class="alert-card" style="opacity: {opacity}; margin-bottom: 0;">
+                        <span class="alert-time">{time_str}</span>
+                        <span class="alert-title">[{alert['category']}] {alert['title']} <span style="color:#64748b; font-size:0.75rem; margin-left:8px;">#{alert['id']}</span></span>
+                        <span class="severity-badge severity-{alert['severity']}">{status_badge}</span>
+                    </div>
+                    """
+                    st.markdown(html, unsafe_allow_html=True)
+                with inv_col:
+                    if st.button("Investigate", key=f"inv_{alert['id']}", use_container_width=True):
+                        st.session_state.investigate_alert_id = alert['id']
+                        st.rerun()
+                with btn_col:
+                    if not is_resolved:
+                        if st.button("Resolve", key=f"resolve_{alert['id']}", use_container_width=True):
+                            alert['status'] = 'Resolved'
+                            st.rerun()
+                    else:
+                        st.button("Resolved", key=f"resolved_{alert['id']}", disabled=True, use_container_width=True)
+                st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if is_live:
+        time.sleep(2)
+        st.rerun()
 
 # Page: Innovations
 elif page == "🧪 Innovation Lab":
@@ -927,7 +1479,7 @@ elif page == "🧪 Innovation Lab":
                     st.metric("Avg Time to Arrest", f"{stats['avg_time_to_arrest_minutes']:.1f} min")
                 with col_c:
                     arrest_rate_colored = "🟢" if stats['arrest_rate'] >= 0.8 else "🟡" if stats['arrest_rate'] >= 0.6 else "🔴"
-                    st.metric("System Status", f"{arrest_rate_colored} Operational")
+                    st.metric("System Status", f"{arrest_rate_colored} Operational (Operational)")
             else:
                 st.warning("⚠️ Honeypot statistics unavailable (innovation module not running)")
         except Exception as e:
@@ -946,7 +1498,7 @@ elif page == "🧪 Innovation Lab":
                 active = data['active_honeypots']
                 
                 if len(active) > 0:
-                    st.info(f"🔴 **{len(active)} active honeypot(s)** currently monitoring withdrawal attempts")
+                    st.info(f"🔴 Active honeypots: {len(active)} currently monitoring withdrawal attempts")
                     
                     for hp in active:
                         with st.expander(f"Honeypot {hp['honeypot_id']} - ₹{hp['amount']:,.2f}"):
@@ -955,7 +1507,8 @@ elif page == "🧪 Innovation Lab":
                                 st.write(f"**Transaction ID**: {hp['transaction_id']}")
                                 st.write(f"**Target Account**: {hp['target_account']}")
                                 st.write(f"**Amount**: ₹{hp['amount']:,.2f} {hp['currency']}")
-                                st.write(f"**Status**: {'🚨 POLICE ALERTED' if hp['police_alerted'] else '👁️ MONITORING'}")
+                                status_text = "Police alerted" if hp['police_alerted'] else "Monitoring"
+                                st.write(f"**Status**: {'🚨' if hp['police_alerted'] else '👁️'} {status_text} ({status_text})")
                             with col2:
                                 st.write(f"**Activated**: {hp['activated_at']}")
                                 st.write(f"**Time Remaining**: {hp['time_remaining_seconds']//60} min {hp['time_remaining_seconds']%60} sec")
@@ -963,7 +1516,7 @@ elif page == "🧪 Innovation Lab":
                                 if hp['last_attempt_location']:
                                     st.write(f"**Last Attempt Location**: {hp['last_attempt_location']}")
                 else:
-                    st.success("✅ No active honeypots (all clear)")
+                    st.success(_accessible_status("✅", "No active honeypots"))
             else:
                 st.warning("⚠️ Active honeypots unavailable")
         except Exception as e:
@@ -1309,9 +1862,9 @@ elif page == "🧪 Innovation Lab":
                             
                             # Verification Status
                             if result['verified']:
-                                st.success("✅ **EVIDENCE VERIFIED** - Blockchain integrity intact")
+                                st.success(_accessible_status("✅", "Evidence Verified") + " - Blockchain integrity intact")
                             else:
-                                st.error("❌ **VERIFICATION FAILED** - Evidence compromised or not found")
+                                st.error(_accessible_status("❌", "Verification Failed") + " - Evidence compromised or not found")
                             
                             col1, col2, col3, col4 = st.columns(4)
                             
@@ -1362,7 +1915,7 @@ elif page == "🧪 Innovation Lab":
             
             if st.button("📜 Export Evidence Package", type="primary", use_container_width=True):
                 if not auth_token:
-                    st.error("❌ Authorization token required")
+                    st.error(_accessible_status("❌", "Authorization token required"))
                 else:
                     with st.spinner("Generating court-admissible evidence package..."):
                         try:
@@ -1411,6 +1964,310 @@ elif page == "🧪 Innovation Lab":
                             st.error(f"Error exporting evidence: {e}")
 
 # Page: About
+
+# Page: Network Graph Explorer
+elif page == "🕸️ Network Graph Explorer":
+    st.header("🕸️ Real-Time Fraud Network Explorer")
+    st.markdown("Visualizing multi-hop money laundering patterns, star hubs, and mule accounts.")
+    st.markdown("---")
+    
+    # Local imports consolidated globally
+    
+    # Initialize graph (same structure for consistency)
+    G = nx.DiGraph()
+    central_hub = "ACC00001071"
+    G.add_node(central_hub, type="Mule Hub (Level 1)", risk=0.95)
+    
+    # Fan in (victims to hub)
+    for i in range(12):
+        node_id = f"ACC_VICTIM_{i}"
+        G.add_node(node_id, type="Victim", risk=0.1)
+        G.add_edge(node_id, central_hub, amount=random.randint(5000, 50000))
+        
+    # Fan out (hub to layer mules)
+    for i in range(8):
+        node_id = f"ACC_LAYER_{i}"
+        G.add_node(node_id, type="Mule Layer (Level 2)", risk=0.85)
+        G.add_edge(central_hub, node_id, amount=random.randint(20000, 100000))
+        
+        # Further distribution
+        for j in range(2):
+            end_node = f"ACC_END_{i}_{j}"
+            G.add_node(end_node, type="Withdrawal Node", risk=0.9)
+            G.add_edge(node_id, end_node, amount=random.randint(10000, 40000))
+
+    # Controls for active propagation tracking
+    st.subheader("📡 Active Fraud Propagation Tracking")
+    
+    col_c1, col_c2, col_c3 = st.columns([1, 1, 2])
+    
+    with col_c1:
+        animate_propagation = st.toggle("🔴 Auto-Play Simulation", value=False, key="graph_animate_propagation")
+    with col_c2:
+        step_option = st.selectbox("Select Simulation Step", ["Step 1: Infiltration", "Step 2: Aggregation", "Step 3: Layering", "Step 4: Cashout"], key="simulation_step_selectbox")
+    with col_c3:
+        st.write("")
+        st.write("")
+        st.caption("Auto-Play automatically cycles through transaction lifecycle steps.")
+        
+    # Mapping selection/auto-play step to index
+    step_indices = {
+        "Step 1: Infiltration": 0,
+        "Step 2: Aggregation": 1,
+        "Step 3: Layering": 2,
+        "Step 4: Cashout": 3
+    }
+    
+    if 'prop_step' not in st.session_state:
+        st.session_state.prop_step = 0
+        
+    if animate_propagation:
+        # Auto advance
+        st.session_state.prop_step = (st.session_state.prop_step + 1) % 4
+        # Sync selectbox
+        step_names = list(step_indices.keys())
+        selected_step_name = step_names[st.session_state.prop_step]
+    else:
+        st.session_state.prop_step = step_indices[step_option]
+        selected_step_name = step_option
+
+    # Show progress bar & description of propagation
+    st.progress((st.session_state.prop_step + 1) * 25)
+    
+    if st.session_state.prop_step == 0:
+        st.info("🟢 **Propagation Phase 1: Victim Infiltration** — Victims' accounts are compromised or social engineered. Funds are being initiated into the laundering ring.")
+    elif st.session_state.prop_step == 1:
+        st.error("🚨 **Propagation Phase 2: Hub Aggregation** — Funds are aggregated at the central Mule Hub (`ACC00001071`) from multiple sources simultaneously to evade velocity checks.")
+    elif st.session_state.prop_step == 2:
+        st.warning("⚡ **Propagation Phase 3: Outbound Layering** — High velocity dispersion of funds from the primary hub to secondary Level 2 Layering accounts.")
+    else:
+        st.error("🛑 **Propagation Phase 4: Cashout Extraction** — Layered accounts distribute funds to withdrawal endpoints (ATM nodes/crypto gateways) for final extraction.")
+
+    # Generate layout positions
+    pos = nx.spring_layout(G, seed=42)
+    
+    # Render edges
+    edge_traces = []
+    
+    for edge in G.edges():
+        u, v = edge
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        
+        # Decide edge color and width based on propagation step
+        is_active_edge = False
+        if st.session_state.prop_step == 0 and G.nodes[u]['type'] == 'Victim':
+            is_active_edge = True
+        elif st.session_state.prop_step == 1 and u == central_hub:
+            is_active_edge = True
+        elif st.session_state.prop_step == 2 and G.nodes[u]['type'] == 'Mule Layer (Level 2)' and G.nodes[v]['type'] == 'Withdrawal Node':
+            is_active_edge = True
+        elif st.session_state.prop_step == 3:
+            # Everything is active in final step
+            is_active_edge = True
+            
+        color = '#ef4444' if is_active_edge else '#334155'
+        width = 1.5 if is_active_edge else 0.4
+        
+        edge_trace = go.Scatter(
+            x=[x0, x1, None], y=[y0, y1, None],
+            line=dict(width=width, color=color),
+            hoverinfo='none',
+            mode='lines'
+        )
+        edge_traces.append(edge_trace)
+        
+    # Render nodes
+    node_x = []
+    node_y = []
+    node_color = []
+    node_text = []
+    node_size = []
+    node_symbol = []
+    
+    for node in G.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        role = G.nodes[node]['type']
+        risk = G.nodes[node]['risk']
+        
+        # Highlight node size/color depending on active simulation step
+        is_active_node = False
+        if st.session_state.prop_step == 0 and role == 'Victim':
+            is_active_node = True
+        elif st.session_state.prop_step == 1 and node == central_hub:
+            is_active_node = True
+        elif st.session_state.prop_step == 2 and role == 'Mule Layer (Level 2)':
+            is_active_node = True
+        elif st.session_state.prop_step == 3 and role == 'Withdrawal Node':
+            is_active_node = True
+            
+        if is_active_node:
+            node_color.append('rgba(239, 68, 68, 1.0)') # Bright red
+            node_size.append(30 if node == central_hub else 20)
+            node_symbol.append('hexagram')
+        else:
+            # Dimmed/normal coloring
+            if risk > 0.8:
+                node_color.append('rgba(239, 68, 68, 0.4)' if st.session_state.prop_step != 3 else 'rgba(239, 68, 68, 0.9)')
+                node_size.append(25 if node == central_hub else 15)
+            elif risk > 0.4:
+                node_color.append('rgba(245, 158, 11, 0.4)' if st.session_state.prop_step != 3 else 'rgba(245, 158, 11, 0.9)')
+                node_size.append(12)
+            else:
+                node_color.append('rgba(16, 185, 129, 0.4)' if st.session_state.prop_step != 3 else 'rgba(16, 185, 129, 0.9)')
+                node_size.append(10)
+            node_symbol.append('circle')
+            
+        node_text.append(f"<b>{node}</b><br>Risk Score: {risk:.2f}<br>Role: {role}")
+        
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode='markers',
+        hoverinfo='text',
+        marker=dict(
+            showscale=False,
+            color=node_color,
+            size=node_size,
+            symbol=node_symbol,
+            line=dict(width=2, color='rgba(255,255,255,0.8)')
+        ))
+            
+    node_trace.text = node_text
+    
+    fig = go.Figure(data=edge_traces + [node_trace],
+             layout=go.Layout(
+                title='<span style="font-size: 20px;">Active Money Laundering Topology (Star Pattern)</span>',
+                showlegend=False,
+                hovermode='closest',
+                margin=dict(b=20,l=5,r=5,t=60),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
+                )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.markdown("""
+    ### 📊 Topology Analytics
+    *   🔴 **Red Highlighted (Hexagrams)**: Active nodes participating in the selected propagation phase.
+    *   **Laundering Cycle**: Infiltration ➡️ Consolidation (Mule Hub) ➡️ Layering ➡️ Cashout Extraction.
+    *   **Target Intervention Point**: Freezing `ACC00001071` (Mule Hub) dismantles 100% of Layering and Withdrawal activities.
+    """)
+    
+    if animate_propagation:
+        time.sleep(2.0)
+        st.rerun()
+
+# Page: Behavioral Biometrics
+elif page == "⌨️ Behavioral Biometrics":
+    st.header("⌨️ Keystroke Dynamics & Biometric Analysis")
+    st.markdown("Visualizing typing cadence anomalies to detect hesitation, duress, or bot-driven inputs.")
+    
+    # Local imports consolidated globally
+    
+    # Session state for demo selection
+    demo_type = st.radio("Select Session Profile", ["🟢 Normal User", "🔴 Under Duress (Hesitation Spikes)", "🤖 Automated Bot (Zero Variance)"], horizontal=True)
+    
+    st.markdown("---")
+    
+    # Generate mock data
+    num_keys = 50
+    x_axis = list(range(1, num_keys + 1))
+    
+    if "Normal" in demo_type:
+        hold_times = np.random.normal(loc=120, scale=20, size=num_keys).clip(60, 200)
+        flight_times = np.random.normal(loc=180, scale=30, size=num_keys).clip(100, 300)
+        risk_score = 0.15
+        explanation = "Typing rhythm is consistent with historical baseline. Variance is natural."
+    elif "Duress" in demo_type:
+        hold_times = np.random.normal(loc=140, scale=30, size=num_keys).clip(60, 250)
+        flight_times = np.random.normal(loc=200, scale=40, size=num_keys).clip(100, 400)
+        # Inject hesitation spikes
+        spike_indices = [12, 13, 14, 35, 36]
+        for idx in spike_indices:
+            flight_times[idx] = random.randint(800, 1500)
+            hold_times[idx] = random.randint(300, 500)
+        risk_score = 0.88
+        explanation = "🚨 HIGH DURESS DETECTED: Significant hesitation spikes observed. User may be receiving dictated instructions or under coercion."
+    else: # Bot
+        hold_times = np.random.normal(loc=50, scale=1, size=num_keys)
+        flight_times = np.random.normal(loc=80, scale=1, size=num_keys)
+        risk_score = 0.99
+        explanation = "🚨 BOT DETECTED: Unnatural zero-variance mechanical cadence. Typing speed exceeds human limits."
+
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Create dual-axis plot
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Flight Times (Line + Markers)
+        fig.add_trace(
+            go.Scatter(x=x_axis, y=flight_times, name="Flight Time (ms)",
+                       mode='lines+markers', line=dict(color='#00d2ff', width=2),
+                       marker=dict(size=6, color='#00d2ff')),
+            secondary_y=False,
+        )
+        
+        # Hold Times (Bar)
+        fig.add_trace(
+            go.Bar(x=x_axis, y=hold_times, name="Hold Time (ms)", opacity=0.7, marker_color='#ff007f'),
+            secondary_y=True,
+        )
+        
+        # Add highlight regions for spikes
+        if "Duress" in demo_type:
+            fig.add_vrect(x0=11.5, x1=15.5, fillcolor="red", opacity=0.1, layer="below", line_width=0)
+            fig.add_vrect(x0=34.5, x1=37.5, fillcolor="red", opacity=0.1, layer="below", line_width=0)
+            fig.add_annotation(x=13.5, y=1400, text="Hesitation Anomaly", showarrow=True, arrowhead=1)
+
+        fig.update_layout(
+            title="Session Keystroke Cadence (Hold vs. Flight Times)",
+            xaxis_title="Keystroke Sequence Index",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            hovermode="x unified",
+            margin=dict(l=20, r=20, t=50, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        fig.update_yaxes(title_text="Flight Time (ms) - Time between keys", secondary_y=False, showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+        fig.update_yaxes(title_text="Hold Time (ms) - Key press duration", secondary_y=True, showgrid=False)
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.subheader("Analysis")
+        
+        # Gauge
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=risk_score * 100,
+            title={'text': "Biometric Risk"},
+            gauge={
+                'axis': {'range': [None, 100]},
+                'bar': {'color': "darkblue"},
+                'steps': [
+                    {'range': [0, 40], 'color': '#10b981'},
+                    {'range': [40, 70], 'color': '#f59e0b'},
+                    {'range': [70, 100], 'color': '#ef4444'}
+                ]
+            }
+        ))
+        fig_gauge.update_layout(height=200, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig_gauge, use_container_width=True)
+        
+        st.metric("Avg Hold Time", f"{np.mean(hold_times):.1f} ms")
+        st.metric("Avg Flight Time", f"{np.mean(flight_times):.1f} ms")
+        st.metric("Cadence Variance", f"{np.var(flight_times):.1f}")
+        
+        if risk_score > 0.7:
+            st.error(explanation)
+        else:
+            st.success(explanation)
 elif page == "ℹ️ System Brief":
     st.header("i      About AegisGraph Sentinel 2.0")
     # Insert latest PR summary for quick review

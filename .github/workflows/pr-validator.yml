@@ -1,0 +1,46 @@
+name: "Strict PR Validator"
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  validate-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-level: '3.10'
+
+      - name: Run Validation Script
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python -c "
+          import os, sys, re
+
+          body = os.getenv('PR_BODY', '')
+
+          # 1. Check for Issue Number (Fixes #123)
+          if not re.search(r'Fixes\s*#\s*\d+', body, re.IGNORECASE):
+              print('❌ ERROR: You must link a valid issue number using \"Fixes #<number>\"')
+              sys.exit(1)
+
+          # 2. Check for Screenshots/Images
+          # Looks for markdown image syntax: ![alt text](url) or HTML <img> tags
+          if not re.search(r'!\[.*?\]\(.*?\)|<img\s+[^>]*src=', body):
+              print('❌ ERROR: You must upload a screenshot (UI or Terminal output) in the Proof section.')
+              sys.exit(1)
+
+          # 3. Check for Testing Description
+          # Ensure they didn't leave the default placeholder and actually wrote something
+          if 'Describe your tests or paste a terminal test log' in body or len(body.strip()) < 100:
+              print('❌ ERROR: Please provide a meaningful description of your testing.')
+              sys.exit(1)
+
+          print('✅ All PR formatting requirements met!')
+          "
