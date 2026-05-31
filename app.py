@@ -14,6 +14,7 @@ except ImportError:
     st_autorefresh = None
 import requests
 import json
+import html
 import base64
 import pandas as pd
 import plotly.graph_objects as go
@@ -59,6 +60,16 @@ def _cache_data(ttl: int):
 def _accessible_status(emoji: str, label: str) -> str:
     """Return a visual status with an adjacent plain-text equivalent."""
     return f"{emoji} {label} ({label})"
+
+
+def _escape_network_tooltip_value(value) -> str:
+    """Escape dynamic graph values before inserting them into tooltip HTML."""
+    return html.escape(str(value), quote=True)
+
+
+def _json_for_inline_script(value) -> str:
+    """Serialize Python values safely for direct insertion into inline JavaScript."""
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _build_batch_transaction(row, index: int) -> dict:
@@ -2340,11 +2351,14 @@ elif page == "🕸️ Network Graph Explorer":
                 'hover': {'background': '#34d399', 'border': '#059669'}
             }
             
+        node_html = _escape_network_tooltip_value(node)
+        role_html = _escape_network_tooltip_value(role)
+
         # Dynamic tooltip with risk statistics and node details
         title = f"""
         <div style="font-family: 'Plus Jakarta Sans', sans-serif; padding: 10px; color: #f1f5f9; background: #0f172a; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); font-size: 13px;">
-            <b style="color: #38bdf8; font-size: 14px;">{node}</b><br/>
-            <b>Role:</b> {role}<br/>
+            <b style="color: #38bdf8; font-size: 14px;">{node_html}</b><br/>
+            <b>Role:</b> {role_html}<br/>
             <b>Risk Score:</b> <span style="color: {'#ef4444' if risk >= 0.7 else '#f59e0b' if risk >= 0.4 else '#10b981'}">{risk:.2%}</span><br/>
             <hr style="margin: 6px 0; border: 0; border-top: 1px solid rgba(255,255,255,0.1);"/>
             <span style="font-size: 11px; color: #94a3b8;">Double-click to expand/collapse connections</span>
@@ -2371,6 +2385,8 @@ elif page == "🕸️ Network Graph Explorer":
     for edge in G.edges():
         u, v = edge
         amount = G[u][v].get('amount', 10000)
+        source_html = _escape_network_tooltip_value(u)
+        destination_html = _escape_network_tooltip_value(v)
         
         is_active_edge = False
         if st.session_state.prop_step == 0 and G.nodes[u]['type'] == 'Victim':
@@ -2392,7 +2408,7 @@ elif page == "🕸️ Network Graph Explorer":
         title = f"""
         <div style="font-family: 'Plus Jakarta Sans', sans-serif; padding: 6px 10px; color: #f1f5f9; background: #1e293b; border-radius: 6px; font-size: 12px;">
             <b>Transfer Amount:</b> ₹{amount:,.2f}<br/>
-            <b>Route:</b> {u} ➡️ {v}
+            <b>Route:</b> {source_html} ➡️ {destination_html}
         </div>
         """
         
@@ -2412,11 +2428,11 @@ elif page == "🕸️ Network Graph Explorer":
         })
 
     # Render custom HTML5 vis.js graph Component
-    import json
     nodes_json = json.dumps(vis_nodes)
     edges_json = json.dumps(vis_edges)
     physics_val = "true" if physics_enabled else "false"
-    search_val = search_query.strip() if search_query.strip() else "None"
+    search_val = search_query.strip()
+    search_json = _json_for_inline_script(search_val or None)
     
     html_content = f"""
     <!DOCTYPE html>
@@ -2557,8 +2573,8 @@ elif page == "🕸️ Network Graph Explorer":
             }});
 
             // Search focusing
-            var searchId = "{search_val}";
-            if (searchId && searchId !== "None") {{
+            var searchId = {search_json};
+            if (searchId) {{
                 setTimeout(function() {{
                     var targetNode = nodes.get(searchId);
                     if (targetNode) {{
