@@ -16,6 +16,7 @@ import logging
 logger = logging.getLogger(__name__)
 import torch
 import numpy as np
+import weakref
 from typing import Dict, Optional, Tuple, List
 import networkx as nx  #models
 
@@ -23,12 +24,34 @@ from ..models.risk_model import FraudDetectionModel
 from ..features.velocity_calculator import VelocityCalculator, Transaction
 from ..features.behavioral_biometrics import analyze_keystroke_data
 from ..features.entropy_calculator import compute_entropy_risk_score
-from ..utils.helpers import load_thresholds
+from ..utils.helpers import get_device, load_thresholds
 from ..scoring import ThresholdConfig, RiskScorer as CentralRiskScorer
 from ..observability import get_logger
 from ..config import defaults as config_defaults
 
 _inference_logger = get_logger("inference.risk_scorer")
+_CENTRALITY_CACHE = weakref.WeakKeyDictionary()
+
+
+def _get_betweenness_centrality(graph: nx.Graph) -> Dict:
+    """Cache betweenness centrality per graph instance and topology snapshot."""
+    if graph is None:
+        return {}
+
+    try:
+        signature = (
+            graph.number_of_nodes() if hasattr(graph, "number_of_nodes") else 0,
+            graph.number_of_edges() if hasattr(graph, "number_of_edges") else 0,
+        )
+        cached = _CENTRALITY_CACHE.get(graph)
+        if cached and cached[0] == signature:
+            return cached[1]
+
+        centrality = nx.betweenness_centrality(graph, k=min(100, signature[0] or 1))
+        _CENTRALITY_CACHE[graph] = (signature, centrality)
+        return centrality
+    except TypeError:
+        return nx.betweenness_centrality(graph, k=min(100, graph.number_of_nodes()))
 
 
 class RiskScorer:
@@ -51,7 +74,8 @@ class RiskScorer:
     ):
         self.model = model
         self.config = config
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        configured_device = config.get('model', {}).get('device')
+        self.device = get_device(str(device) if device is not None else configured_device)
         
         self.model.to(self.device)
         self.model.eval()
@@ -342,25 +366,33 @@ class RiskScorer:
 
 def compute_risk_score(
     transaction: dict,
-    graph_data: Optional[dict] = None,
     biometrics: Optional[dict] = None,
-    **kwargs
+    *,
+    graph_loaded: bool,
+    transaction_graph,
+    mule_accounts: set[str],
+    centrality_baseline: dict[str, list[float]],
+    centrality_window_size: int,
+    account_profiles: dict[str, dict],
+    config: dict,
 ) -> Dict[str, float]:
     """
     Enhanced risk scorer with graph-based mule account detection
     
     Args:
         transaction: Transaction data
-        graph_data: Graph representation
         biometrics: Behavioral biometrics
-        **kwargs: Additional parameters (state, etc.)
+        graph_loaded: Whether graph-backed detection is enabled
+        transaction_graph: Graph object or provider
+        mule_accounts: Known mule account identifiers
+        centrality_baseline: Rolling centrality history by account
+        centrality_window_size: Rolling baseline size
+        account_profiles: Account profile lookup
+        config: Runtime configuration
     
     Returns:
         Risk score dictionary with mule detection
     """
-    # Import state from the API module
-    from ..api.main import state
-    
     risk_score = 0.0
     breakdown = {
         'graph': 0.0,
@@ -376,43 +408,44 @@ def compute_risk_score(
     # 1. GRAPH-BASED RISK (50% weight)
     graph_risk = 0.0
     centrality = None
+    graph_view = None
     
     # Check mule accounts even without graph loaded (for demo mode)
-    if state.graph_loaded:
+    if graph_loaded:
         # Check if accounts are in known fraud chains (mule accounts)
-        if source_account in state.mule_accounts:
+        if source_account in mule_accounts:
             graph_risk += 0.6
             _inference_logger.warning(
                 f"Source account {source_account} is a known mule account",
                 event_type="mule_account_detected",
                 metadata={"account": source_account, "role": "source"},
             )
-        if target_account in state.mule_accounts:
+        if target_account in mule_accounts:
             graph_risk += 0.4
             _inference_logger.warning(
                 f"Target account {target_account} is a known mule account",
                 event_type="mule_account_detected",
                 metadata={"account": target_account, "role": "target"},
             )
-        if source_account in state.mule_accounts and target_account in state.mule_accounts:
+        if source_account in mule_accounts and target_account in mule_accounts:
             graph_risk += 0.3
 
-    if state.graph_loaded and state.transaction_graph:
+    if graph_loaded and transaction_graph:
         # Mule-account penalties are applied in the block above.
         # They are intentionally NOT repeated here — the original code added
         # them a second time, doubling graph_risk for every mule transaction
         # and masking all topology signals (fix for Issue #133).
 
         # Check graph topology patterns
-        if hasattr(state.transaction_graph, "is_active") and state.transaction_graph.is_active:
-            G = state.transaction_graph.get_approx_subgraph(source_account, max_hops=2)
+        if hasattr(transaction_graph, "is_active") and transaction_graph.is_active:
+            G = transaction_graph.get_approx_subgraph(source_account, max_hops=2)
         else:
-            G = state.transaction_graph
+            G = transaction_graph
         
         if source_account in G.nodes:
             # Analyze source account patterns
-            out_degree = G.out_degree(source_account)
-            in_degree = G.in_degree(source_account)
+            out_degree = graph_view.out_degree(source_account)
+            in_degree = graph_view.in_degree(source_account)
             
             # STAR PATTERN: High out-degree (distribution hub)
             if out_degree > 20:
@@ -436,10 +469,10 @@ def compute_risk_score(
             
             # Check if part of a chain (linear path pattern)
             try:
-                descendants = nx.descendants(G, source_account)
+                descendants = nx.descendants(graph_view, source_account)
                 if len(descendants) >= 3:
                     # Check if forms a linear chain
-                    subgraph = G.subgraph([source_account] + list(descendants))
+                    subgraph = graph_view.subgraph([source_account] + list(descendants))
                     if nx.is_directed_acyclic_graph(subgraph):
                         graph_risk += 0.2
                         _inference_logger.warning(
@@ -453,7 +486,7 @@ def compute_risk_score(
             # Betweenness centrality (key intermediary in network)
             try:
                 if centrality is None:
-                    centrality = nx.betweenness_centrality(G, k=min(100, G.number_of_nodes()))
+                    centrality = _get_betweenness_centrality(graph_view)
                 if source_account in centrality and centrality[source_account] > 0.01:
                     graph_risk += 0.15
                     _inference_logger.warning(
@@ -471,26 +504,26 @@ def compute_risk_score(
     lateral_movement_detected = False
     lateral_movement_reason = ""
     
-    if state.graph_loaded and state.transaction_graph:
-        if hasattr(state.transaction_graph, "is_active") and state.transaction_graph.is_active:
-            G = state.transaction_graph.get_approx_subgraph(source_account, max_hops=2)
+    if graph_loaded and transaction_graph:
+        if hasattr(transaction_graph, "is_active") and transaction_graph.is_active:
+            G = transaction_graph.get_approx_subgraph(source_account, max_hops=2)
             has_node = G.has_node(source_account)
         else:
-            G = state.transaction_graph
+            G = transaction_graph
             has_node = source_account in G.nodes if hasattr(G, "nodes") else False
 
         if has_node:
             try:
                 if centrality is None:
-                    centrality = nx.betweenness_centrality(G, k=min(100, G.number_of_nodes()))
+                    centrality = _get_betweenness_centrality(G)
                 if source_account in centrality:
                     current_score = centrality[source_account]
                     
                     # Get or initialize baseline
-                    if source_account not in state.centrality_baseline:
-                        state.centrality_baseline[source_account] = []
+                    if source_account not in centrality_baseline:
+                        centrality_baseline[source_account] = []
                     
-                    baseline_history = state.centrality_baseline[source_account]
+                    baseline_history = centrality_baseline[source_account]
                     
                     if len(baseline_history) >= 3:
                         baseline_avg = np.mean(baseline_history)
@@ -517,7 +550,7 @@ def compute_risk_score(
                     
                     # Update baseline (rolling window)
                     baseline_history.append(current_score)
-                    if len(baseline_history) > state.centrality_window_size:
+                    if len(baseline_history) > centrality_window_size:
                         baseline_history.pop(0)
                         
             except Exception as e:
@@ -537,8 +570,8 @@ def compute_risk_score(
         velocity_risk += 0.1
     
     # Check against account history if available
-    if state.account_profiles and source_account in state.account_profiles:
-        profile = state.account_profiles[source_account]
+    if account_profiles and source_account in account_profiles:
+        profile = account_profiles[source_account]
         avg_amount = profile.get('avg_transaction_amount', 0)
         if avg_amount > 0 and amount > 3 * avg_amount:
             velocity_risk += 0.3
@@ -620,7 +653,7 @@ def compute_risk_score(
         }
     except Exception as e:
         logger.error(f"Error: {e}")
-        thresholds = state.config.get('risk_scoring', {}).get('thresholds', {
+        thresholds = config.get('risk_scoring', {}).get('thresholds', {
             'allow': config_defaults.DEFAULT_RISK_THRESHOLDS["allow"],
             'review': config_defaults.DEFAULT_RISK_THRESHOLDS["review"],
             'block': config_defaults.DEFAULT_RISK_THRESHOLDS["block"],

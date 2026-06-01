@@ -25,6 +25,7 @@ Pilot Results (HDFC Mumbai, 6 months):
 import json
 import time
 import threading
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -113,7 +114,7 @@ class HoneypotEscrowManager:
         self._active_honeypots_by_account: Dict[str, HoneypotTransaction] = {}
         
         # Historical honeypots
-        self.honeypot_history: List[HoneypotTransaction] = []
+        self.honeypot_history: deque = deque(maxlen=10000)
         
         # Statistics (from pilot study - HDFC Mumbai, 6 months)
         self.stats = {
@@ -123,6 +124,13 @@ class HoneypotEscrowManager:
             'total_recovered': 47000000.0,  # ₹4.7 crore
             'total_false_positives': 7,  # 18% false positive rate
             'average_response_time_minutes': 12.0,  # 12-min avg response time
+        }
+        
+        # Daily statistics for realtime monitoring
+        self.daily_stats = {
+            'date': datetime.now().date(),
+            'arrests': 0,
+            'recovered': 0.0,
         }
     
     def should_activate_honeypot(
@@ -347,6 +355,11 @@ class HoneypotEscrowManager:
             # Update statistics
             self.stats['total_arrests'] += 1
             self.stats['total_recovered'] += honeypot.amount
+            
+            # Update daily statistics
+            self._check_daily_reset()
+            self.daily_stats['arrests'] += 1
+            self.daily_stats['recovered'] += honeypot.amount
 
             # Calculate response time
             first_withdrawal = honeypot.withdrawal_attempts[0] if honeypot.withdrawal_attempts else None
@@ -367,8 +380,6 @@ class HoneypotEscrowManager:
         
         with self._lock:
             self.honeypot_history.append(honeypot)
-            if len(self.honeypot_history) > 10000:
-                self.honeypot_history = self.honeypot_history[-5000:]
             del self.active_honeypots[honeypot_id]
             self._active_honeypots_by_account.pop(honeypot.target_account, None)
 
@@ -477,14 +488,30 @@ class HoneypotEscrowManager:
         
         with self._lock:
             self.honeypot_history.append(honeypot)
-            if len(self.honeypot_history) > 10000:
-                self.honeypot_history = self.honeypot_history[-5000:]
             del self.active_honeypots[honeypot_id]
             self._active_honeypots_by_account.pop(honeypot.target_account, None)
     
+    def _check_daily_reset(self):
+        """Reset daily statistics if 24 hours have elapsed."""
+        today = datetime.now().date()
+        if self.daily_stats['date'] != today:
+            self.daily_stats['date'] = today
+            self.daily_stats['arrests'] = 0
+            self.daily_stats['recovered'] = 0.0
+
+    def get_daily_stats(self) -> Dict:
+        """Get thread-safe daily statistics"""
+        with self._lock:
+            self._check_daily_reset()
+            return {
+                'arrests_today': self.daily_stats['arrests'],
+                'recovered_today': self.daily_stats['recovered'],
+            }
+
     def get_statistics(self) -> Dict:
         """Get honeypot system statistics"""
         with self._lock:
+            self._check_daily_reset()
             total_activated = max(self.stats['total_activated'], 1)
             return {
                 'total_activated': self.stats['total_activated'],
@@ -496,8 +523,8 @@ class HoneypotEscrowManager:
                 'false_positive_rate': self.stats['total_false_positives'] / total_activated,
                 'avg_time_to_arrest_minutes': self.stats['average_response_time_minutes'],
                 'active_honeypots': len(self.active_honeypots),
-                'arrests_today': 0,  # TODO: Track daily stats
-                'recovered_today': 0.0,  # TODO: Track daily stats
+                'arrests_today': self.daily_stats['arrests'],
+                'recovered_today': self.daily_stats['recovered'],
             }
     
     def get_active_honeypots(self) -> List[Dict]:

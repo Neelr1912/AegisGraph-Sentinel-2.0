@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Deque, Dict, Optional
 
+from .events import EventDispatcher, RuntimeEventBus
 from .service_container import ServiceContainer
 from .task_registry import TaskRegistry
 from .health_monitor import RuntimeHealthMonitor
@@ -15,6 +17,8 @@ from .health_monitor import RuntimeHealthMonitor
 class RuntimeState:
     """Central runtime container attached to the legacy AppState object."""
 
+    _max_lifecycle_events: ClassVar[int] = 1000
+
     services: ServiceContainer = field(default_factory=ServiceContainer)
     tasks: TaskRegistry = field(default_factory=TaskRegistry)
     health_monitor: RuntimeHealthMonitor = field(default_factory=RuntimeHealthMonitor)
@@ -23,7 +27,21 @@ class RuntimeState:
     legacy_state: Optional[Any] = None
     started: bool = False
     shutting_down: bool = False
-    lifecycle_events: List[Dict[str, Any]] = field(default_factory=list)
+    lifecycle_events: Deque[Dict[str, Any]] = field(init=False)
+
+    # ── Event infrastructure ────────────────────────────────────────────
+    event_bus: RuntimeEventBus = field(default_factory=RuntimeEventBus)
+    dispatcher: EventDispatcher = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.lifecycle_events = deque(maxlen=self._max_lifecycle_events)
+        self.dispatcher = EventDispatcher(self._event_bus_ref())
+
+    # EventDispatcher needs a reference to the event_bus field.  Using a
+    # helper avoids capturing 'self' in a lambda stored on self before the
+    # dataclass is fully constructed.
+    def _event_bus_ref(self) -> RuntimeEventBus:
+        return self.event_bus
 
     def bind_legacy_state(self, state: Any) -> None:
         self.legacy_state = state

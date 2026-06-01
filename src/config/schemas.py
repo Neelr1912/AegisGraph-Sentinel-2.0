@@ -21,13 +21,24 @@ class EnvironmentVariablesSchema(ConfigBaseModel):
     app_env: Optional[str] = Field(default=None, description="APP_ENV compatibility override.")
     environment: Optional[str] = Field(default=None, description="ENVIRONMENT compatibility override.")
     api_url: Optional[str] = Field(default=None, description="External API URL required in production.")
-    aegis_allowed_origins: Optional[str] = Field(default=None, description="Comma-separated CORS origins.")
+    aegis_allowed_origins: Optional[str] = Field(default=None, description="Comma-separated CORS origins (deprecated: use CORS_ORIGINS).")
+    cors_origins: Optional[str] = Field(default=None, description="Comma-separated CORS origins.")
     debug: Optional[str] = Field(default=None, description="Enables debug-only routes when true.")
     aegis_graph_path: Optional[str] = Field(default=None, description="Optional verified graph artifact path.")
     aegis_graph_sha256: Optional[str] = Field(default=None, description="Expected SHA256 for graph artifact.")
     redis_url: Optional[str] = Field(default=None, description="Optional Redis backend URL.")
     aegis_config_path: Optional[str] = Field(default=None, description="Optional runtime YAML path.")
     aegis_thresholds_path: Optional[str] = Field(default=None, description="Optional thresholds YAML path.")
+    api_host: Optional[str] = Field(default=None, description="API host address (default: 0.0.0.0).")
+    api_port: Optional[str] = Field(default=None, description="API port number (default: 8000).")
+    api_reload: Optional[str] = Field(default=None, description="Enable API auto-reload on code changes.")
+    api_log_level: Optional[str] = Field(default=None, description="API logging level (default: info).")
+    rate_limit: Optional[str] = Field(default=None, description="Rate limit configuration (default: 100/minute).")
+    max_batch_size: Optional[str] = Field(default=None, description="Maximum batch processing size (default: 100).")
+    log_level: Optional[str] = Field(default=None, description="Application logging level (default: INFO).")
+    log_format: Optional[str] = Field(default=None, description="Log format: json or text (default: json).")
+    log_output_dir: Optional[str] = Field(default=None, description="Log output directory (default: logs).")
+    prometheus_port: Optional[str] = Field(default=None, description="Prometheus metrics port (default: 9090).")
 
     @property
     def runtime_environment(self) -> str:
@@ -58,6 +69,16 @@ class APISettings(ConfigBaseModel):
         if isinstance(value, (list, tuple)):
             return [str(item).strip() for item in value if str(item).strip()]
         raise TypeError("allowed_origins must be a comma-separated string or list")
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def reject_wildcard_origins(cls, value: List[str]) -> List[str]:
+        if "*" in value:
+            raise ValueError(
+                "Unsafe CORS configuration: wildcard origins cannot be used "
+                "while credentialed requests are enabled"
+            )
+        return value
 
 
 class GraphRuntimeSettings(ConfigBaseModel):

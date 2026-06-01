@@ -1,5 +1,6 @@
 """Unit test suite for verifying the Neo4jGraphProvider connection and subgraph extraction operations."""
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 import networkx as nx
@@ -15,6 +16,16 @@ class TestNeo4jGraphProvider(unittest.TestCase):
         self.mock_uri = "bolt://localhost:7687"
         self.mock_user = "neo4j"
         self.mock_password = "password"
+        self.env_patcher = patch.dict(
+            "os.environ",
+            {"AEGIS_NEO4J_URI": self.mock_uri,
+             "AEGIS_NEO4J_USER": self.mock_user,
+             "AEGIS_NEO4J_PASSWORD": self.mock_password},
+        )
+        self.env_patcher.start()
+
+    def tearDown(self) -> None:
+        self.env_patcher.stop()
 
     @patch("src.core.providers.neo4j.neo4j", create=True)
     def test_provider_initialization_success(self, mock_neo4j_lib) -> None:
@@ -64,6 +75,28 @@ class TestNeo4jGraphProvider(unittest.TestCase):
         provider = Neo4jGraphProvider(enabled=False)
         self.assertFalse(provider.enabled)
         self.assertFalse(provider.is_active)
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_provider_handles_missing_credentials_gracefully(self) -> None:
+        """Verify that enabling the provider without credentials raises a clear error."""
+        with patch("src.core.providers.neo4j.NEO4J_AVAILABLE", False):
+            provider = Neo4jGraphProvider(enabled=True)
+        
+        self.assertFalse(provider.is_active)
+        self.assertFalse(provider.enabled)
+
+    def test_provider_resolves_env_vars(self) -> None:
+        """Verify that credentials are resolved from environment variables."""
+        with patch.dict("os.environ", {
+            "NEO4J_URI": "bolt://env-test:7687",
+            "NEO4J_USER": "env_user",
+            "NEO4J_PASSWORD": "env_pass",
+        }, clear=True):
+            with patch("src.core.providers.neo4j.NEO4J_AVAILABLE", False):
+                provider = Neo4jGraphProvider(enabled=True)
+                self.assertEqual(provider.uri, "bolt://env-test:7687")
+                self.assertEqual(provider.user, "env_user")
+                self.assertEqual(provider.password, "env_pass")
 
     @patch("src.core.providers.neo4j.neo4j", create=True)
     def test_nodes_edges_count_queries(self, mock_neo4j_lib) -> None:
@@ -181,3 +214,49 @@ class TestNeo4jGraphProvider(unittest.TestCase):
             
             self.assertIs(cached_subgraph, subgraph)
             mock_session.run.assert_not_called()
+
+    @patch("src.core.providers.neo4j.neo4j", create=True)
+    def test_subgraph_cache_evicts_lru_entry(self, mock_neo4j_lib) -> None:
+        """Verify the cache stays bounded and evicts the least-recently-used entry."""
+        mock_driver = MagicMock()
+        mock_session = MagicMock()
+        mock_neo4j_lib.GraphDatabase.driver.return_value = mock_driver
+        mock_driver.session.return_value.__enter__.return_value = mock_session
+
+        def build_result(src_id: str, dst_id: str) -> MagicMock:
+            mock_relationship = MagicMock()
+            mock_node_start = MagicMock()
+            mock_node_start.get.return_value = src_id
+            mock_node_start.__getitem__.return_value = src_id
+
+            mock_node_end = MagicMock()
+            mock_node_end.get.return_value = dst_id
+            mock_node_end.__getitem__.return_value = dst_id
+
+            mock_relationship.nodes = (mock_node_start, mock_node_end)
+            mock_relationship.get.side_effect = lambda key, default=None: {
+                "amount": 1.0,
+                "timestamp": 1.0,
+            }.get(key, default)
+
+            mock_path = MagicMock()
+            mock_path.relationships = [mock_relationship]
+
+            result = MagicMock()
+            result.__iter__.return_value = [{"path": mock_path}]
+            return result
+
+        mock_session.run.side_effect = [
+            build_result("ACC1", "ACC2"),
+            build_result("ACC3", "ACC4"),
+        ]
+
+        with patch("src.core.providers.neo4j.NEO4J_AVAILABLE", True):
+            provider = Neo4jGraphProvider(enabled=True, cache_ttl_seconds=60, cache_max_entries=1)
+
+            provider.get_approx_subgraph("ACC1", max_hops=2)
+            provider.get_approx_subgraph("ACC3", max_hops=2)
+
+            self.assertEqual(list(provider._subgraph_cache.keys()), ["ACC3"])
+            self.assertNotIn("ACC1", provider._subgraph_cache)
+            self.assertEqual(mock_session.run.call_count, 2)

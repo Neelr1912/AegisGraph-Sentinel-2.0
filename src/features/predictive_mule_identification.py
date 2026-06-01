@@ -25,6 +25,8 @@ Features Analyzed:
 12. KYC document anomalies
 """
 
+import bisect
+from collections import OrderedDict, deque
 import numpy as np
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -90,12 +92,16 @@ class PredictiveMuleScorer:
     ):
         self.temporal_window = temporal_window
         self.risk_threshold = risk_threshold
-        
+        self.MAX_HISTORY_SIZE = 10000
+
         # Cache for temporal clustering
-        self.recent_openings: List[AccountOpeningData] = []
-        self.device_history: Dict[str, int] = {}  # device_id -> count
-        self.ip_history: Dict[str, int] = {}  # ip -> count
-        self.referral_history: Dict[str, int] = {}  # referral_code -> count
+        self.recent_openings: deque = deque()
+        self._opening_timestamps: List[datetime] = []
+        self._timestamp_offset = 0
+        # OrderedDict enables LRU eviction: least recently used items sit at the front
+        self.device_history: Dict[str, int] = OrderedDict()
+        self.ip_history: Dict[str, int] = OrderedDict()
+        self.referral_history: Dict[str, int] = OrderedDict()
 
     def _normalize_referral_code(self, referral_code: Optional[str]) -> Optional[str]:
         """Normalize referral codes so empty values do not poison the same bucket."""
@@ -224,11 +230,11 @@ class PredictiveMuleScorer:
         referral_code = self._normalize_referral_code(account_data.referral_code)
         same_referral_count = self.referral_history.get(referral_code, 0) if referral_code else 0
         
-        # Temporal clustering
-        recent_count = len([
-            a for a in self.recent_openings
-            if (account_data.opening_timestamp - a.opening_timestamp).total_seconds() / 60 < self.temporal_window
-        ])
+        # Temporal clustering (binary search on sorted timestamps, O(log N))
+        cutoff = account_data.opening_timestamp - timedelta(minutes=self.temporal_window)
+        idx = bisect.bisect_left(self._opening_timestamps, cutoff, lo=self._timestamp_offset)
+        effective_len = len(self._opening_timestamps) - self._timestamp_offset
+        recent_count = effective_len - (idx - self._timestamp_offset)
         
         return {
             'form_duration_minutes': form_duration,
@@ -474,40 +480,46 @@ class PredictiveMuleScorer:
     
     def _update_cache(self, account_data: AccountOpeningData):
         """Update temporal cache with new account opening"""
-        # Add to recent openings
+        # O(1) deque append + popleft for account data
         self.recent_openings.append(account_data)
-        
-        # Keep only recent openings (last 24 hours)
+        self._opening_timestamps.append(account_data.opening_timestamp)
         cutoff = datetime.now() - timedelta(hours=24)
-        self.recent_openings = [
-            a for a in self.recent_openings
-            if a.opening_timestamp > cutoff
-        ]
-        
-        # Limit to prevent memory exhaustion
-        if len(self.recent_openings) > self.MAX_HISTORY_SIZE * 10:
-            self.recent_openings = self.recent_openings[-self.MAX_HISTORY_SIZE * 10:]
-        
-        # Update device history
+        while self.recent_openings and self.recent_openings[0].opening_timestamp <= cutoff:
+            self.recent_openings.popleft()
+            self._opening_timestamps[self._timestamp_offset] = None  # mark as tombstone
+            self._timestamp_offset += 1
+
+        # Enforce hard memory cap
+        while len(self.recent_openings) > self.MAX_HISTORY_SIZE:
+            self.recent_openings.popleft()
+            self._opening_timestamps[self._timestamp_offset] = None
+            self._timestamp_offset += 1
+
+        # Periodically compact the timestamp list when offset exceeds half its length
+        if self._timestamp_offset > len(self._opening_timestamps) // 2:
+            self._opening_timestamps = self._opening_timestamps[self._timestamp_offset:]
+            self._timestamp_offset = 0
+
+        # Update device history (LRU-friendly)
         device_id = account_data.device_id
         self.device_history[device_id] = self.device_history.get(device_id, 0) + 1
-        
+        self.device_history.move_to_end(device_id)
+
         # Update IP history
         ip = account_data.ip_address
         self.ip_history[ip] = self.ip_history.get(ip, 0) + 1
-        
+        self.ip_history.move_to_end(ip)
+
         # Update referral history
         ref = self._normalize_referral_code(account_data.referral_code)
         if ref:
             self.referral_history[ref] = self.referral_history.get(ref, 0) + 1
+            self.referral_history.move_to_end(ref)
 
-        # Prevent unbounded memory growth by capping dictionary sizes
-        MAX_HISTORY_SIZE = 10000
+        # LRU eviction: pop least recently used entries (front of OrderedDict)
         for history_dict in (self.device_history, self.ip_history, self.referral_history):
-            if len(history_dict) > MAX_HISTORY_SIZE:
-                keys_to_remove = list(history_dict.keys())[:1000]
-                for k in keys_to_remove:
-                    del history_dict[k]
+            while len(history_dict) > self.MAX_HISTORY_SIZE:
+                history_dict.popitem(last=False)
     
     def get_statistics(self) -> Dict[str, int]:
         """Get statistics about recent account openings"""
@@ -516,6 +528,7 @@ class PredictiveMuleScorer:
             'unique_devices': len(self.device_history),
             'unique_ips': len(self.ip_history),
             'unique_referrals': len(self.referral_history),
+            'cache_compactions': self._timestamp_offset,
         }
 
 

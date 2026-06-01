@@ -63,6 +63,35 @@ class TestKeystrokeDynamics:
         # Stressed typing should have higher stress score
         assert features['stress_score'] > 0.3
 
+    def test_analyze_does_not_reiterate_raw_events(self):
+        """Test analyze() reuses extracted interval metrics instead of rescanning input."""
+        analyzer = KeystrokeDynamicsAnalyzer()
+
+        class OneShotEvents:
+            def __init__(self, payload):
+                self._payload = payload
+                self._consumed = False
+
+            def __iter__(self):
+                if self._consumed:
+                    raise AssertionError("analyze() should not iterate raw events twice")
+                self._consumed = True
+                return iter(self._payload)
+
+        events = OneShotEvents([
+            {'key': 'a', 'timestamp': 0.0, 'event_type': 'keydown'},
+            {'key': 'a', 'timestamp': 0.1, 'event_type': 'keyup'},
+            {'key': 'b', 'timestamp': 0.15, 'event_type': 'keydown'},
+            {'key': 'b', 'timestamp': 0.25, 'event_type': 'keyup'},
+            {'key': 'c', 'timestamp': 0.3, 'event_type': 'keydown'},
+            {'key': 'c', 'timestamp': 0.4, 'event_type': 'keyup'},
+        ])
+
+        features = analyzer.analyze(events)
+
+        assert 'timestamp_interval_cv' in features
+        assert features['stress_score'] >= 0
+
 
 class TestVelocityCalculator:
     """Test transaction velocity calculator"""
@@ -194,6 +223,27 @@ class TestGraphEntropyCalculator:
         # Mule should have high entropy due to many diverse neighbors
         assert entropy > 0
 
+    def test_structural_entropy_counts_neighbor_edges_without_pairwise_scan(self):
+        """Test structural entropy uses induced neighbor edge counting."""
+        import networkx as nx
+
+        calculator = GraphEntropyCalculator()
+        graph = nx.Graph()
+        graph.add_edges_from([
+            ('A', 'B'),
+            ('A', 'C'),
+            ('A', 'D'),
+            ('B', 'C'),
+            ('C', 'D'),
+        ])
+
+        neighbor_set = {'B', 'C', 'D'}
+        assert calculator._count_edges_between_neighbors(graph, neighbor_set) == 2
+
+        structural = calculator.compute_structural_entropy('A', graph)
+        assert structural['clustering_coefficient'] > 0
+        assert structural['structural_entropy'] > 0
+
 
 class TestFeatureIntegration:
     """Test integration of multiple features"""
@@ -229,6 +279,177 @@ class TestFeatureIntegration:
         assert isinstance(biometrics, dict)
         assert isinstance(kinetic_energy, float)
         assert isinstance(entropy, float)
+
+    def test_k_hop_neighbors_avoids_revisiting_cycle_nodes(self):
+        """Test k-hop expansion stops revisiting nodes in a cycle."""
+        import networkx as nx
+
+        entropy_calculator = GraphEntropyCalculator()
+        graph = nx.Graph()
+        graph.add_edges_from([
+            ('A', 'B'),
+            ('B', 'C'),
+            ('C', 'A'),
+            ('C', 'D'),
+        ])
+
+        neighbors = entropy_calculator._get_k_hop_neighbors('A', graph, 3)
+
+        assert neighbors == {'B', 'C', 'D'}
+        assert len(neighbors) == 3
+
+    def test_all_entropy_features_share_one_neighborhood_snapshot(self, monkeypatch):
+        """Test multi-feature entropy reuse avoids repeated neighborhood walks."""
+        calculator = GraphEntropyCalculator()
+        sentinel_graph = object()
+        build_calls = []
+        profile = {
+            'direct_neighbors': {'B', 'C'},
+            'k_hop_neighbors': {'B', 'C', 'D'},
+            'subgraph': object(),
+            'neighbor_degrees': [2, 2],
+            'edges_between_neighbors': 1,
+        }
+
+        def traced_build(node, graph):
+            build_calls.append((node, graph))
+            return profile
+
+        monkeypatch.setattr(calculator, "_build_neighborhood_profile", traced_build)
+
+        features = calculator.compute_all_entropy_features(
+            'A',
+            sentinel_graph,
+            node_attributes={
+                'A': {'type': 'source'},
+                'B': {'type': 'relay'},
+                'C': {'type': 'relay'},
+            },
+            edge_timestamps={
+                ('A', 'B'): 10.0,
+                ('A', 'C'): 12.0,
+            },
+            edge_amounts={
+                ('A', 'B'): 100.0,
+                ('A', 'C'): 120.0,
+            },
+            current_time=20.0,
+        )
+
+        assert build_calls == [('A', sentinel_graph)]
+        assert features['degree_entropy'] >= 0
+        assert features['structural_entropy'] >= 0
+
+
+class TestPredictiveMuleCache:
+    """Test PredictiveMuleScorer cache optimization (issue #435)"""
+
+    def test_inplace_expiry_no_rebuild(self):
+        """_update_cache uses in-place pop(0) instead of full-list comprehension."""
+        from src.features.predictive_mule_identification import (
+            PredictiveMuleScorer,
+            AccountOpeningData,
+        )
+        from datetime import datetime, timedelta
+
+        scorer = PredictiveMuleScorer()
+
+        # Insert a stale entry (older than 24h)
+        stale = AccountOpeningData(
+            opening_timestamp=datetime.now() - timedelta(hours=48),
+            form_start_time=datetime.now() - timedelta(hours=48),
+            form_submit_time=datetime.now() - timedelta(hours=48),
+            name="stale", age=20, profession="s", stated_address="a",
+            email="s@t.com", phone_number="0", kyc_document_type="PAN",
+            facial_match_score=0.5, document_quality_score=0.5,
+            ip_address="1.1.1.1", device_id="d0", device_age_days=0,
+            browser_fingerprint="f0", referrer_url=None,
+            initial_deposit=0.0, account_type="S", referral_code=None,
+            existing_customer_connections=0,
+        )
+        scorer._update_cache(stale)
+        assert len(scorer.recent_openings) == 0, "Stale entry should be evicted in-place"
+
+        # Fresh entries should be kept
+        fresh = AccountOpeningData(
+            opening_timestamp=datetime.now(),
+            form_start_time=datetime.now(),
+            form_submit_time=datetime.now(),
+            name="fresh", age=20, profession="s", stated_address="a",
+            email="f@t.com", phone_number="1", kyc_document_type="PAN",
+            facial_match_score=0.5, document_quality_score=0.5,
+            ip_address="2.2.2.2", device_id="d1", device_age_days=0,
+            browser_fingerprint="f1", referrer_url=None,
+            initial_deposit=0.0, account_type="S", referral_code=None,
+            existing_customer_connections=0,
+        )
+        scorer._update_cache(fresh)
+        assert len(scorer.recent_openings) == 1
+
+    def test_lru_eviction(self):
+        """History dicts evict least recently used entries first."""
+        from src.features.predictive_mule_identification import (
+            PredictiveMuleScorer,
+            AccountOpeningData,
+        )
+        from datetime import datetime
+
+        scorer = PredictiveMuleScorer()
+        scorer.MAX_HISTORY_SIZE = 3  # small for testing
+
+        # Insert 4 entries with distinct IPs — the first should be evicted
+        for i in range(4):
+            data = AccountOpeningData(
+                opening_timestamp=datetime.now(),
+                form_start_time=datetime.now(),
+                form_submit_time=datetime.now(),
+                name=f"u{i}", age=20, profession="s", stated_address="a",
+                email=f"u{i}@t.com", phone_number=str(i),
+                kyc_document_type="PAN", facial_match_score=0.5,
+                document_quality_score=0.5, ip_address=f"10.0.0.{i}",
+                device_id=f"d{i}", device_age_days=0,
+                browser_fingerprint=f"f{i}", referrer_url=None,
+                initial_deposit=0.0, account_type="S", referral_code=None,
+                existing_customer_connections=0,
+            )
+            scorer._update_cache(data)
+
+        # LRU: 10.0.0.0 should be evicted, 10.0.0.{1,2,3} remain
+        assert "10.0.0.0" not in scorer.ip_history
+        assert "10.0.0.1" in scorer.ip_history
+        assert "10.0.0.2" in scorer.ip_history
+        assert "10.0.0.3" in scorer.ip_history
+        assert len(scorer.ip_history) == 3
+
+    def test_device_count_tracking(self):
+        """Device history correctly increments and survives eviction."""
+        from src.features.predictive_mule_identification import (
+            PredictiveMuleScorer,
+            AccountOpeningData,
+        )
+        from datetime import datetime
+
+        scorer = PredictiveMuleScorer()
+        scorer.MAX_HISTORY_SIZE = 2
+
+        for i in range(3):
+            data = AccountOpeningData(
+                opening_timestamp=datetime.now(),
+                form_start_time=datetime.now(),
+                form_submit_time=datetime.now(),
+                name=f"u{i}", age=20, profession="s", stated_address="a",
+                email=f"u{i}@t.com", phone_number=str(i),
+                kyc_document_type="PAN", facial_match_score=0.5,
+                document_quality_score=0.5, ip_address=f"10.0.0.{i}",
+                device_id="shared_device", device_age_days=0,
+                browser_fingerprint=f"f{i}", referrer_url=None,
+                initial_deposit=0.0, account_type="S", referral_code=None,
+                existing_customer_connections=0,
+            )
+            scorer._update_cache(data)
+
+        # Same device seen 3 times -> count is 3
+        assert scorer.device_history["shared_device"] == 3
 
 
 if __name__ == "__main__":

@@ -97,6 +97,14 @@ class FraudPatternDetector:
         # Build directed transfer graph
         graph = self._build_transfer_graph(transactions)
         
+        # Build (source, target) -> [txn] index once to avoid O(N) rescans per cycle
+        txn_index: Dict[tuple, List[Dict]] = defaultdict(list)
+        for txn in transactions:
+            src = self._txn_value(txn, 'source_account')
+            tgt = self._txn_value(txn, 'target_account')
+            if src and tgt:
+                txn_index[(src, tgt)].append(txn)
+        
         detected_rings = []
         
         # Search for cycles with bounded depth and lazy enumeration.
@@ -107,9 +115,9 @@ class FraudPatternDetector:
                 max_cycle_count=max_cycle_count,
             ):
                 if len(cycle) >= self.min_chain_length:
-                    # Extract transactions in this cycle
+                    # Extract transactions in this cycle using pre-built index
                     cycle_transactions = self._get_cycle_transactions(
-                        graph, cycle, transactions
+                        graph, cycle, txn_index
                     )
                     
                     # Check time constraints
@@ -207,39 +215,43 @@ class FraudPatternDetector:
         Returns:
             List of detected hubs with risk scores
         """
-        # Count incoming transfers per account
-        incoming_counts = defaultdict(list)
-        
+        # Single pass: collect transfers while incrementally aggregating
+        incoming_counts: Dict[str, List[Dict]] = defaultdict(list)
+        source_sets: Dict[str, set] = defaultdict(set)
+        amount_sums: Dict[str, float] = defaultdict(float)
+
         for txn in transactions:
             target = self._txn_value(txn, 'target_account')
             if target:
                 incoming_counts[target].append(txn)
-        
+                source_sets[target].add(self._txn_value(txn, 'source_account'))
+                amount_sums[target] += self._txn_value(txn, 'amount', 0)
+
         detected_hubs = []
-        
+
         for account, transfers in incoming_counts.items():
-            if len(transfers) >= threshold_incoming:
-                # Risk factors
-                unique_sources = len(set(self._txn_value(t, 'source_account') for t in transfers))
-                avg_amount = np.mean([self._txn_value(t, 'amount', 0) for t in transfers])
-                
+            num_transfers = len(transfers)
+            if num_transfers >= threshold_incoming:
+                unique_sources = len(source_sets[account])
+                avg_amount = amount_sums[account] / num_transfers
+
                 hub_score = self._score_fan_in_hub(
                     account,
                     transfers,
                     unique_sources,
                     avg_amount,
                 )
-                
+
                 detected_hubs.append({
                     'type': 'FAN_IN_HUB',
                     'account': account,
-                    'incoming_transfer_count': len(transfers),
+                    'incoming_transfer_count': num_transfers,
                     'unique_sources': unique_sources,
                     'avg_transfer_amount': avg_amount,
-                    'total_received': sum(self._txn_value(t, 'amount', 0) for t in transfers),
+                    'total_received': amount_sums[account],
                     'risk_score': hub_score,
                 })
-        
+
         return sorted(detected_hubs, key=lambda x: x['risk_score'], reverse=True)
     
     def detect_fan_out_hubs(
@@ -255,38 +267,44 @@ class FraudPatternDetector:
         Returns:
             List of detected hubs with risk scores
         """
-        # Count outgoing transfers per account
-        outgoing_counts = defaultdict(list)
-        
+        # Single pass: collect transfers while incrementally aggregating
+        outgoing_counts: Dict[str, List[Dict]] = defaultdict(list)
+        target_sets: Dict[str, set] = defaultdict(set)
+        amount_sums: Dict[str, float] = defaultdict(float)
+
         for txn in transactions:
             source = self._txn_value(txn, 'source_account')
             if source:
                 outgoing_counts[source].append(txn)
-        
+                target_sets[source].add(self._txn_value(txn, 'target_account'))
+                amount_sums[source] += self._txn_value(txn, 'amount', 0)
+
         detected_hubs = []
-        
+
         for account, transfers in outgoing_counts.items():
-            if len(transfers) >= threshold_outgoing:
-                unique_targets = len(set(self._txn_value(t, 'target_account') for t in transfers))
-                avg_amount = np.mean([self._txn_value(t, 'amount', 0) for t in transfers])
-                
+            num_transfers = len(transfers)
+            if num_transfers >= threshold_outgoing:
+                unique_targets = len(target_sets[account])
+                avg_amount = amount_sums[account] / num_transfers
+
                 hub_score = self._score_fan_out_hub(
                     account,
                     transfers,
                     unique_targets,
                     avg_amount,
+                    total_amount=amount_sums[account],
                 )
-                
+
                 detected_hubs.append({
                     'type': 'FAN_OUT_HUB',
                     'account': account,
-                    'outgoing_transfer_count': len(transfers),
+                    'outgoing_transfer_count': num_transfers,
                     'unique_targets': unique_targets,
                     'avg_transfer_amount': avg_amount,
-                    'total_distributed': sum(self._txn_value(t, 'amount', 0) for t in transfers),
+                    'total_distributed': amount_sums[account],
                     'risk_score': hub_score,
                 })
-        
+
         return sorted(detected_hubs, key=lambda x: x['risk_score'], reverse=True)
     
     def detect_velocity_anomalies(
@@ -440,20 +458,15 @@ class FraudPatternDetector:
         self,
         graph: nx.DiGraph,
         cycle: List,
-        transactions: List[Dict],
+        txn_index: Dict[tuple, List[Dict]],
     ) -> List[Dict]:
-        """Extract transactions forming a cycle"""
+        """Extract transactions forming a cycle using pre-built index."""
         cycle_txns = []
         
         for i in range(len(cycle)):
             source = cycle[i]
             target = cycle[(i + 1) % len(cycle)]
-            
-            # Find transactions between these accounts
-            for txn in transactions:
-                if (self._txn_value(txn, 'source_account') == source and
-                    self._txn_value(txn, 'target_account') == target):
-                    cycle_txns.append(txn)
+            cycle_txns.extend(txn_index.get((source, target), []))
         
         return cycle_txns
     
@@ -565,14 +578,14 @@ class FraudPatternDetector:
         transfers: List[Dict],
         unique_targets: int,
         avg_amount: float,
+        total_amount: float = 0.0,
     ) -> float:
         """Score fan-out hub risk"""
         score = 0.0
         
         diversity_score = min(unique_targets / 30.0, 1.0)
         count_score = min(len(transfers) / 60.0, 1.0)
-        total = sum(self._txn_value(t, 'amount', 0) for t in transfers)
-        total_score = 0.2 if total > 1000000 else 0.0
+        total_score = 0.2 if total_amount > 1000000 else 0.0
 
         return ScoreCalculator.aggregate_scores(
             {
@@ -795,6 +808,14 @@ class FraudPatternDetector:
         if len(undirected_graph.nodes()) < min_clique_size:
             return []
         
+        # Build (source, target) -> txn index once to avoid O(N) rescans per clique
+        txn_map: Dict[tuple, Dict] = {}
+        for txn in transactions:
+            src = self._txn_value(txn, 'source_account')
+            dst = self._txn_value(txn, 'target_account')
+            if src and dst:
+                txn_map[(src, dst)] = txn
+        
         detected_rings = []
         
         try:
@@ -816,9 +837,9 @@ class FraudPatternDetector:
                     density = nx.density(clique_subgraph)
                     
                     if density >= density_threshold:
-                        # Get transactions within this clique
+                        # Get transactions within this clique using pre-built index
                         clique_txns = self._get_clique_transactions(
-                            clique, graph, transactions
+                            clique, graph, txn_map
                         )
                         
                         if clique_txns:
@@ -1123,34 +1144,32 @@ class FraudPatternDetector:
         transactions: List[Dict],
     ) -> List[Dict]:
         """Extract transactions forming a linear chain"""
+        # Build a (source, target) -> [txns] index for O(1) lookups
+        index: Dict[tuple, List[Dict]] = defaultdict(list)
+        for txn in transactions:
+            src = self._txn_value(txn, 'source_account')
+            tgt = self._txn_value(txn, 'target_account')
+            if src and tgt:
+                index[(src, tgt)].append(txn)
+
         chain_txns = []
-        
         for i in range(len(chain) - 1):
-            source = chain[i]
-            target = chain[i + 1]
-            
-            for txn in transactions:
-                if (self._txn_value(txn, 'source_account') == source and
-                    self._txn_value(txn, 'target_account') == target):
-                    chain_txns.append(txn)
-        
+            chain_txns.extend(index.get((chain[i], chain[i + 1]), []))
         return chain_txns
 
     def _get_clique_transactions(
         self,
         clique: List[str],
         graph: nx.DiGraph,
-        transactions: List[Dict],
+        txn_map: Dict[tuple, Dict],
     ) -> List[Dict]:
-        """Extract all transactions within a clique"""
+        """Extract all transactions within a clique using pre-built index."""
         clique_set = set(clique)
         clique_txns = []
-        
-        for txn in transactions:
-            source = self._txn_value(txn, 'source_account')
-            target = self._txn_value(txn, 'target_account')
-            
-            if source in clique_set and target in clique_set:
-                clique_txns.append(txn)
+        for u, v in graph.edges():
+            if u in clique_set and v in clique_set:
+                txn = txn_map.get((u, v))
+                if txn:
+                    clique_txns.append(txn)
         
         return clique_txns

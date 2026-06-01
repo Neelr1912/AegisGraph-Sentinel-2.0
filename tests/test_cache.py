@@ -2,6 +2,7 @@
 
 import networkx as nx
 import pytest
+from unittest.mock import patch
 
 from src.utils.cache import (
     GraphCache,
@@ -69,6 +70,41 @@ class TestInMemoryGraphCache:
         
         assert len(cache.cache) == 10  # Should evict oldest
 
+    def test_cache_ttl_is_enforced_on_read(self, cache):
+        """Test that expired entries are removed and missed on access."""
+        with patch("src.utils.cache.time.time", side_effect=[100.0, 103.0]):
+            cache.set("key1", "value1", ttl=2)
+            assert cache.get("key1") is None
+            assert "key1" not in cache.cache
+
+    def test_cache_methods_use_lock(self, cache):
+        """Test that core cache operations run under the shared lock."""
+
+        class RecordingLock:
+            def __init__(self):
+                self.entered = 0
+                self.exited = 0
+
+            def __enter__(self):
+                self.entered += 1
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.exited += 1
+                return False
+
+        lock = RecordingLock()
+        cache._lock = lock
+
+        cache.set("key1", "value1")
+        cache.get("key1")
+        cache.invalidate("key1")
+        cache.clear()
+        cache.get_stats()
+
+        assert lock.entered == lock.exited
+        assert lock.entered >= 5
+
 
 class TestGraphOperationCache:
     """Test high-level graph operation caching"""
@@ -108,6 +144,36 @@ class TestGraphOperationCache:
         G2 = nx.DiGraph()
         G2.add_edges_from([("A", "B"), ("B", "D")])
         
+        hash1 = GraphOperationCache._hash_graph(G1)
+        hash2 = GraphOperationCache._hash_graph(G2)
+        assert hash1 != hash2
+
+    def test_graph_hash_changes_when_edge_weight_changes(self):
+        """Test that weighted edge changes invalidate the graph hash."""
+        G1 = nx.DiGraph()
+        G1.add_weighted_edges_from([("A", "B", 1.0)])
+        G1["A"]["B"]["timestamp"] = 100.0
+
+        G2 = nx.DiGraph()
+        G2.add_weighted_edges_from([("A", "B", 2.0)])
+        G2["A"]["B"]["timestamp"] = 100.0
+
+        hash1 = GraphOperationCache._hash_graph(G1)
+        hash2 = GraphOperationCache._hash_graph(G2)
+        assert hash1 != hash2
+
+    def test_graph_hash_changes_when_edge_metadata_changes(self):
+        """Test that non-weight edge metadata also invalidates the graph hash."""
+        G1 = nx.DiGraph()
+        G1.add_weighted_edges_from([("A", "B", 1.0)])
+        G1["A"]["B"]["timestamp"] = 100.0
+        G1["A"]["B"]["channel"] = "card"
+
+        G2 = nx.DiGraph()
+        G2.add_weighted_edges_from([("A", "B", 1.0)])
+        G2["A"]["B"]["timestamp"] = 100.0
+        G2["A"]["B"]["channel"] = "wire"
+
         hash1 = GraphOperationCache._hash_graph(G1)
         hash2 = GraphOperationCache._hash_graph(G2)
         assert hash1 != hash2

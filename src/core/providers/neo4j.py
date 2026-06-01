@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import List, Optional, Tuple
 
 import networkx as nx
 
@@ -17,31 +19,69 @@ try:
 except ImportError:
     NEO4J_AVAILABLE = False
 
+# Secure URI schemes for Neo4j
+_SECURE_SCHEMES = ("neo4j+s://", "neo4j+ssc://", "bolt+s://", "bolt+ssc://")
+
+
+def _upgrade_uri(uri: str) -> str:
+    if uri.startswith("bolt://"):
+        return uri.replace("bolt://", "bolt+ssc://", 1)
+    if uri.startswith("neo4j://"):
+        return uri.replace("neo4j://", "neo4j+ssc://", 1)
+    return uri
+
+
+def _is_secure(uri: str) -> bool:
+    return any(uri.startswith(s) for s in _SECURE_SCHEMES)
+
 
 class Neo4jGraphProvider:
     """
     Production-grade Neo4j implementation of the GraphService interface.
-    
+
     Provides thread-safe pool-based connections, Cypher transaction queries,
     and highly performant local subgraph extraction parsed directly into NetworkX.
+
+    Credentials are resolved in the following order:
+      1. Explicit constructor arguments
+      2. Environment variables (AEGIS_NEO4J_URI / NEO4J_URI, etc.)
+      3. Raises ValueError if neither is provided
+
+    Transport encryption:
+      By default the provider upgrades unencrypted URIs (bolt://, neo4j://)
+      to encrypted variants (bolt+ssc://, neo4j+ssc://).
+      Set require_encryption=False or AEGIS_NEO4J_REQUIRE_ENCRYPTION=false
+      to allow plain-text connections (not recommended for production).
     """
 
     def __init__(
         self,
-        uri: str = "bolt://localhost:7687",
-        user: str = "neo4j",
-        password: str = "password",
+        uri: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
         enabled: bool = True,
         cache_ttl_seconds: int = 60,
+        cache_max_entries: int = 1024,
+        require_encryption: Optional[bool] = None,
     ) -> None:
-        self.uri = uri
-        self.user = user
-        self.password = password
+        self.uri = uri or os.getenv("AEGIS_NEO4J_URI") or os.getenv("NEO4J_URI")
+        self.user = user or os.getenv("AEGIS_NEO4J_USER") or os.getenv("NEO4J_USER")
+        self.password = password or os.getenv("AEGIS_NEO4J_PASSWORD") or os.getenv("NEO4J_PASSWORD")
+
+        # Resolve require_encryption: constructor arg > env var > default True
+        if require_encryption is None:
+            env_val = os.getenv("AEGIS_NEO4J_REQUIRE_ENCRYPTION", "true").strip().lower()
+            require_encryption = env_val not in ("false", "0", "no")
+        self.require_encryption = require_encryption
+
         self.enabled = enabled and NEO4J_AVAILABLE
         self.cache_ttl_seconds = cache_ttl_seconds
+        self.cache_max_entries = cache_max_entries
+        if self.cache_max_entries < 1:
+            raise ValueError("cache_max_entries must be at least 1")
 
         self._driver: Optional[neo4j.Driver] = None
-        self._subgraph_cache: Dict[str, Tuple[float, nx.DiGraph]] = {}
+        self._subgraph_cache: OrderedDict[str, Tuple[float, nx.DiGraph]] = OrderedDict()
 
         if not NEO4J_AVAILABLE and enabled:
             logger.warning(
@@ -51,6 +91,24 @@ class Neo4jGraphProvider:
             self.enabled = False
 
         if self.enabled:
+            if not self.uri or not self.user or not self.password:
+                raise ValueError(
+                    "Neo4j credentials are required. Either pass them explicitly to "
+                    "Neo4jGraphProvider() or set the AEGIS_NEO4J_URI, AEGIS_NEO4J_USER, "
+                    "and AEGIS_NEO4J_PASSWORD environment variables "
+                    "(or NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD as fallback)."
+                )
+
+            if self.require_encryption and not _is_secure(self.uri):
+                upgraded = _upgrade_uri(self.uri)
+                logger.warning(
+                    "Neo4j URI %s uses unencrypted transport; upgrading to %s. "
+                    "Set AEGIS_NEO4J_REQUIRE_ENCRYPTION=false to allow plain-text.",
+                    self.uri,
+                    upgraded,
+                )
+                self.uri = upgraded
+
             try:
                 self._driver = neo4j.GraphDatabase.driver(
                     self.uri,
@@ -60,14 +118,40 @@ class Neo4jGraphProvider:
                 )
                 # Verify connectivity immediately
                 self._driver.verify_connectivity()
-                logger.info(f"✓ Successfully connected to Neo4j database at {self.uri}")
+                logger.info(f"Successfully connected to Neo4j database at {self.uri}")
             except Exception as e:
                 logger.error(
-                    f"⚠ Failed to establish a connection pool to Neo4j: {e}. "
+                    f"Failed to establish a connection pool to Neo4j: {e}. "
                     "Operating in offline graceful fallback mode."
                 )
                 self.enabled = False
                 self._driver = None
+
+    def _cache_key(self, account_id: str, max_hops: int) -> str:
+        return f"{account_id}:h{max_hops}"
+
+    def _get_cached_subgraph(self, account_id: str, max_hops: int, now: float) -> Optional[nx.DiGraph]:
+        key = self._cache_key(account_id, max_hops)
+        cached_entry = self._subgraph_cache.get(key)
+        if not cached_entry:
+            return None
+
+        cache_time, cached_graph = cached_entry
+        if now - cache_time >= self.cache_ttl_seconds:
+            self._subgraph_cache.pop(key, None)
+            return None
+
+        self._subgraph_cache.move_to_end(key)
+        return cached_graph
+
+    def _store_cached_subgraph(self, account_id: str, max_hops: int, graph: nx.DiGraph, now: float) -> None:
+        key = self._cache_key(account_id, max_hops)
+        self._subgraph_cache[key] = (now, graph)
+        self._subgraph_cache.move_to_end(key)
+
+        while len(self._subgraph_cache) > self.cache_max_entries:
+            self._subgraph_cache.popitem(last=False)
+
 
     @property
     def is_active(self) -> bool:
@@ -152,60 +236,104 @@ class Neo4jGraphProvider:
                     timestamp=timestamp,
                 )
             # Invalidate any cached local subgraphs for the involved accounts
-            self._subgraph_cache.pop(src_account, None)
-            self._subgraph_cache.pop(dst_account, None)
+            self._subgraph_cache = OrderedDict(
+                (k, v) for k, v in self._subgraph_cache.items()
+                if not k.startswith(f"{src_account}:") and not k.startswith(f"{dst_account}:")
+            )
         except Exception as e:
             logger.error(f"Failed to record transaction {src_account} -> {dst_account} in Neo4j: {e}")
+
+    DEFAULT_SUBGRAPH_LIMIT = 10_000
 
     def get_approx_subgraph(self, account_id: str, max_hops: int = 2) -> nx.DiGraph:
         """
         Extract the k-hop local transaction network around an account ID from Neo4j,
         reconstructing it as a directed NetworkX DiGraph.
         """
+        if max_hops < 1:
+            max_hops = 1
         if not self.is_active:
-            # Return an empty graph if the provider is offline
             G = nx.DiGraph()
             G.add_node(account_id)
             return G
 
-        # Check in-memory TTL cache
         now = time.time()
-        if account_id in self._subgraph_cache:
-            cache_time, cached_graph = self._subgraph_cache[account_id]
-            if now - cache_time < self.cache_ttl_seconds:
-                return cached_graph
+        cached_graph = self._get_cached_subgraph(account_id, max_hops, now)
+        if cached_graph is not None:
+            return cached_graph
 
         G = nx.DiGraph()
         G.add_node(account_id)
 
-        # Retrieve paths matching the k-hop undirected pattern
+        limit = self.DEFAULT_SUBGRAPH_LIMIT
+        hop_pattern = f"[r:TRANSFER*1..{max_hops}]"
         query = (
-            "MATCH path = (a:Account {id: $account_id})-[r:TRANSFER*1..2]-(b:Account)\n"
-            "RETURN path"
+            f"MATCH path = (a:Account {{id: $account_id}})-{hop_pattern}-(b:Account)\n"
+            "RETURN path\n"
+            "LIMIT $limit"
         )
+
         try:
             with self._driver.session() as session:
-                result = session.run(query, account_id=account_id)
+                result = session.run(
+                    query,
+                    account_id=account_id,
+                    limit=limit
+                )
+
+                record_count = 0
+
                 for record in result:
+                    record_count += 1
+
                     path = record["path"]
+
                     for relationship in path.relationships:
                         start_node = relationship.nodes[0]
                         end_node = relationship.nodes[1]
-                        
+
                         start_id = start_node["id"]
                         end_id = end_node["id"]
 
                         amount = relationship.get("amount", 0.0)
                         timestamp = relationship.get("timestamp", 0.0)
 
-                        G.add_edge(start_id, end_id, weight=amount, timestamp=timestamp)
+                        G.add_edge(
+                            start_id,
+                            end_id,
+                            weight=amount,
+                            timestamp=timestamp
+                        )
 
-            self._subgraph_cache[account_id] = (now, G)
+                if record_count >= limit:
+                    logger.warning(
+                        "Subgraph extraction reached the configured limit (%s records). "
+                        "Large fraud networks may be truncated and analysis may be incomplete.",
+                        limit,
+                    )
+
+                if len(G.nodes()) >= limit:
+                    logger.warning(
+                        "Extracted graph contains %s nodes and may have been truncated. "
+                        "Analysis accuracy may be affected.",
+                        len(G.nodes()),
+                    )
+
+                if len(G.edges()) >= limit:
+                    logger.warning(
+                        "Extracted graph contains %s edges and may have been truncated. "
+                        "Analysis accuracy may be affected.",
+                        len(G.edges()),
+                    )
+
+            self._store_cached_subgraph(account_id, max_hops, G, now)
             return G
+
         except Exception as e:
-            logger.error(f"Error extracting subgraph for account {account_id}: {e}")
+            logger.error(
+                f"Error extracting subgraph for account {account_id}: {e}"
+            )
             return G
-
     def close(self) -> None:
         """Release connection pool handles."""
         if self._driver:
