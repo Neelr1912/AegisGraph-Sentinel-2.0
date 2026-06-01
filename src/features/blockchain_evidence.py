@@ -1519,8 +1519,8 @@ class BlockchainEvidenceManager:
                 )
                 self._chain_integrity_cache_checked_at = now
             except Exception as exc:
-                logger.warning("Chain integrity refresh failed: %s", exc)
-                self._chain_integrity_cache = False
+                logging.warning("Chain integrity refresh failed: %s", exc)
+                self._chain_integrity_cache_checked_at = now
                 self._chain_integrity_cache_checked_at = now
 
         self.stats['chain_verified'] = bool(self._chain_integrity_cache)
