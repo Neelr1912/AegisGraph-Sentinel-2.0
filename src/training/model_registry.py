@@ -66,8 +66,8 @@ class ModelRegistry:
         with self._manifest_lock:
             self._manifest = self._load_manifest()  # Refresh manifest to avoid overwriting concurrent updates
             self._manifest["versions"].append(entry)
-            if len(versions) > self._max_history:
-                self._manifest["versions"] = versions[-self._max_history:]
+            if len(self._manifest["versions"]) > self._max_history:
+                self._manifest["versions"] = self._manifest["versions"][-self._max_history:]
             self._write_manifest()
         return version_id
 
