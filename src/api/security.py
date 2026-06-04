@@ -153,13 +153,19 @@ def require_role(*allowed_roles: Role):
     ) -> Role:
         # Check if require_api_key is bypassed in any loaded main module version in sys.modules
         is_bypassed = False
+        debug_info = []
         for mod_name, module in list(sys.modules.items()):
-            if mod_name.endswith("api.main") or mod_name == "api.main" or mod_name == "main":
+            if mod_name.endswith("api.main") or mod_name == "api.main" or mod_name == "main" or "api" in mod_name or "main" in mod_name:
                 app_obj = getattr(module, "app", None)
                 if app_obj is not None:
+                    overrides = [getattr(k, "__name__", str(k)) for k in app_obj.dependency_overrides]
+                    debug_info.append(f"{mod_name}: {overrides}")
                     if any(getattr(k, "__name__", None) == "require_api_key" for k in app_obj.dependency_overrides):
                         is_bypassed = True
-                        break
+
+        if not is_bypassed:
+            # Print debug info to stderr if not bypassed
+            print(f"DEBUG_BYPASS_FAILED: sys.modules search info: {debug_info}", file=sys.stderr)
 
         if is_bypassed:
             return Role.SUPER_ADMIN
