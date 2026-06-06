@@ -1977,9 +1977,9 @@ async def explain_transaction(
 
 # Enhanced Aegis-Oracle endpoint
 @app.post(
-    "/api/v1/oracle/explain/basic",
+    "/api/v1/oracle/explain",
     tags=["Analytics"],
-    summary="Get basic AI reasoning (Legacy) for fraud decisions",
+    summary="Get comprehensive AI reasoning for fraud decisions",
     description="Advanced Aegis-Oracle endpoint with full forensic analysis and causal reasoning",
     dependencies=[Depends(require_role(Role.ANALYST))]
 )
