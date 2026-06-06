@@ -89,7 +89,34 @@ Behavioral Analyzer ────────────────────
 
 ## 🚀 Quick Start
 
-### Installation
+### Docker Local Development (Recommended)
+
+The easiest way to run the complete stack (Backend, Frontend, Redis, Neo4j) locally is using Docker Compose.
+
+**Prerequisites:**
+- Docker
+- Docker Compose
+
+**Build and Run:**
+```bash
+# Start all services with hot-reloading enabled
+docker compose up --build
+```
+
+**Access the Services:**
+- Frontend (Streamlit): http://localhost:8501
+- Backend API Docs: http://localhost:8000/docs
+- Neo4j Browser: http://localhost:7474 (Login: `neo4j` / `changeme`)
+
+**Stop Services:**
+```bash
+docker compose down
+```
+
+*Troubleshooting: If you encounter port conflicts, ensure ports 8000, 8501, 6379, 7474, and 7687 are free. To reset database data, run `docker compose down -v`.*
+
+### Manual Installation
+
 
 ```bash
 # Clone the repository
