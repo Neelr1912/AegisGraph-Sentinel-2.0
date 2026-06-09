@@ -547,7 +547,8 @@ class RedisLedger:
                 socket_timeout=2,
             )
             self._client.ping()
-        except Exception:
+        except Exception as e:
+            logger.warning("Redis connection failed, falling back to journal: %s", e)
             self._client = None  # fall back silently; journal is the safety net
 
     def _mark_unavailable(self) -> None:
@@ -571,7 +572,8 @@ class RedisLedger:
             pipe.ltrim(index_key, -self.MAX_EVIDENCE_INDEX_SIZE, -1)
             pipe.incr(f"{self.PREFIX}:stats:total_sealed")
             pipe.execute()
-        except Exception:
+        except Exception as e:
+            logger.warning("Redis save_evidence failed, marking unavailable: %s", e)
             self._mark_unavailable()
 
     def load_evidence(self, evidence_id: str) -> Optional[dict]:
@@ -581,7 +583,8 @@ class RedisLedger:
         try:
             raw = self._client.get(f"{self.PREFIX}:evidence:{evidence_id}")
             return json.loads(raw) if raw else None
-        except Exception:
+        except Exception as e:
+            logger.warning("Redis load_evidence failed, marking unavailable: %s", e)
             self._mark_unavailable()
             return None
 
@@ -592,7 +595,8 @@ class RedisLedger:
         try:
             val = self._client.get(f"{self.PREFIX}:stats:total_sealed")
             return int(val) if val else 0
-        except Exception:
+        except Exception as e:
+            logger.warning("Redis total_sealed failed, marking unavailable: %s", e)
             self._mark_unavailable()
             return 0
 
@@ -610,7 +614,8 @@ class RedisLedger:
                 key = f"{self.PREFIX}:block:{block['block_number']}"
                 self._client.set(key, payload)
                 self._client.expire(key, self.BLOCK_METADATA_TTL)
-        except Exception:
+        except Exception as e:
+            logger.warning("Redis save_block_metadata failed, marking unavailable: %s", e)
             self._mark_unavailable()
 
     def load_block_metadata(self, block_number: Optional[int] = None) -> Optional[dict]:
@@ -625,7 +630,8 @@ class RedisLedger:
             )
             raw = self._client.get(key)
             return json.loads(raw) if raw else None
-        except Exception:
+        except Exception as e:
+            logger.warning("Redis load_block_metadata failed, marking unavailable: %s", e)
             self._mark_unavailable()
             return None
 

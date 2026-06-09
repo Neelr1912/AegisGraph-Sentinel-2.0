@@ -133,7 +133,7 @@ async def get_optional_user(authorization: Optional[str] = Depends(bearer_scheme
     
     try:
         return await get_current_user(authorization)
-    except:
+    except Exception:
         return None
 
 

@@ -327,7 +327,8 @@ class VelocityCalculator:
                 dt = value.to_pydatetime()
                 dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
                 return float(dt.timestamp())
-            except Exception:
+            except Exception as e:
+                logger.debug("Timestamp normalization failed for value %s: %s", value, e)
                 return fallback
 
         if isinstance(value, str):

@@ -422,7 +422,8 @@ def compute_risk_score(
                 else getattr(api_state, "account_profiles", {})
             )
             config = config if config is not None else getattr(api_state, "config", {})
-        except Exception:
+        except Exception as e:
+            _inference_logger.debug("Failed to access API state attributes: %s", e)
             graph_loaded = False
 
     mule_accounts = mule_accounts or set()
