@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel, EmailStr, Field
 import secrets
 
+from src.exceptions import AuthenticationError
 from src.saas.auth.service import (
     AuthProvider,
     AuthService,
@@ -24,6 +25,10 @@ router = APIRouter(prefix="/api/v1/auth", tags=["authentication"])
 # Security schemes
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 bearer_scheme = HTTPBearer(auto_error=False)
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., description="A valid refresh token issued by a previous login")
 
 
 class LoginRequest(BaseModel):
@@ -327,15 +332,23 @@ async def sso_callback(request: SSOCallbackRequest):
     )
 
 
-@router.post("/refresh")
-async def refresh_token(refresh_token: str):
-    """Refresh access token"""
-    # In production, validate refresh token and issue new access token
-    return {
-        "access_token": "new_access_token",
-        "refresh_token": "new_refresh_token",
-        "expires_in": 3600,
-    }
+@router.post("/refresh", response_model=LoginResponse)
+async def refresh_token(body: RefreshTokenRequest):
+    """Exchange a valid refresh token for a new access/refresh token pair."""
+    try:
+        result = auth_service.refresh_tokens(body.refresh_token)
+    except AuthenticationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        )
+    return LoginResponse(
+        access_token=result.access_token,
+        refresh_token=result.refresh_token,
+        expires_in=auth_service.access_token_expiry,
+        user={"id": result.user_id},
+        organization={"id": result.organization_id},
+    )
 
 
 @router.post("/logout")
